@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Discord Chat Interface</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        body {
+            background-color: #1e1f22;
+            color: #dcddde;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .container {
+            display: flex;
+            height: 100vh;
+        }
+
+        /* Sidebar Styles */
+        .sidebar {
+            width: 240px;
+            background-color: #2f3136;
+            display: flex;
+            flex-direction: column;
+            border-right: 1px solid #36393f;
+        }
+
+        .sidebar-header {
+            padding: 16px;
+            display: flex;
+            align-items: center;
+            border-bottom: 1px solid #36393f;
+        }
+
+        .sidebar-header h2 {
+            font-size: 18px;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        .server-list {
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .server-item {
+            display: flex;
+            align-items: center;
+            padding: 10px 16px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        .server-item:hover {
+            background-color: #36393f;
+        }
+
+        .server-icon {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            margin-right: 12px;
+            background-color: #7289da;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+        }
+
+        .server-info {
+            flex: 1;
+        }
+
+        .server-name {
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        .server-status {
+            font-size: 12px;
+            color: #747f8d;
+        }
+
+        .channel-list {
+            background-color: #292b2f;
+            border-top: 1px solid #36393f;
+        }
+
+        .channel-header {
+            padding: 12px 16px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #8e9297;
+            text-transform: uppercase;
+        }
+
+        .channel-item {
+            display: flex;
+            align-items: center;
+            padding: 8px 16px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        .channel-item:hover {
+            background-color: #36393f;
+        }
+
+        .channel-icon {
+            width: 20px;
+            height: 20px;
+            margin-right: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .channel-name {
+            font-size: 14px;
+        }
+
+        .dm-list {
+            background-color: #292b2f;
+            border-top: 1px solid #36393f;
+        }
+
+        .user-list {
+            background-color: #292b2f;
+            border-top: 1px solid #36393f;
+        }
+
+        /* Main Content Styles */
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background-color: #36393f;
+        }
+
+        .chat-header {
+            padding: 16px;
+            border-bottom: 1px solid #4f545c;
+            display: flex;
+            align-items: center;
+        }
+
+        .chat-avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            margin-right: 12px;
+        }
+
+        .chat-info {
+            flex: 1;
+        }
+
+        .chat-name {
+            font-size: 18px;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        .chat-status {
+            font-size: 14px;
+            color: #747f8d;
+        }
+
+        .chat-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .action-btn {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background-color: #4f545c;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        .action-btn:hover {
+            background-color: #5c636e;
+        }
+
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+        }
+
+        .message {
+            margin-bottom: 16px;
+        }
+
+        .message-header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .message-avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            margin-right: 12px;
+        }
+
+        .message-info {
+            flex: 1;
+        }
+
+        .message-author {
+            font-size: 14px;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        .message-time {
+            font-size: 12px;
+            color: #747f8d;
+        }
+
+        .message-content {
+            font-size: 14px;
+            line-height: 1.5;
+            color: #dcddde;
+        }
+
+        .message-image {
+            max-width: 100%;
+            border-radius: 4px;
+            margin-top: 8px;
+        }
+
+        .message-media {
+            margin-top: 8px;
+        }
+
+        .message-media img {
+            max-width: 100%;
+            border-radius: 4px;
+        }
+
+        .chat-input {
+            padding: 16px;
+            border-top: 1px solid #4f545c;
+            display: flex;
+            align-items: center;
+        }
+
+        .input-field {
+            flex: 1;
+            background-color: #40444b;
+            border: none;
+            border-radius: 20px;
+            padding: 10px 16px;
+            color: #dcddde;
+            font-size: 14px;
+        }
+
+        .input-field::placeholder {
+            color: #747f8d;
+        }
+
+        .input-actions {
+            display: flex;
+            gap: 8px;
+            margin-left: 8px;
+        }
+
+        .input-action {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background-color: #4f545c;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        .input-action:hover {
+            background-color: #5c636e;
+        }
+
+        /* Responsive Styles */
+        @media (max-width: 768px) {
+            .container {
+                flex-direction: column;
+            }
+
+            .sidebar {
+                width: 100%;
+                height: auto;
+                border-right: none;
+                border-bottom: 1px solid #36393f;
+            }
+
+            .sidebar-header {
+                justify-content: space-between;
+            }
+
+            .server-list {
+                display: flex;
+                overflow-x: auto;
+                padding: 8px 0;
+            }
+
+            .server-item {
+                flex-shrink: 0;
+                padding: 8px 12px;
+            }
+
+            .channel-list, .dm-list, .user-list {
+                display: none;
+            }
+
+            .main-content {
+                height: calc(100vh - 56px);
+            }
+
+            .chat-header {
+                padding: 12px;
+            }
+
+            .chat-name {
+                font-size: 16px;
+            }
+
+            .chat-status {
+                font-size: 12px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .sidebar-header h2 {
+                font-size: 16px;
+            }
+
+            .server-icon {
+                width: 28px;
+                height: 28px;
+            }
+
+            .chat-name {
+                font-size: 14px;
+            }
+
+            .message-author {
+                font-size: 12px;
+            }
+
+            .message-time {
+                font-size: 10px;
+            }
+
+            .message-content {
+                font-size: 12px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <h2>Серверы</h2>
+            </div>
+            <div class="server-list">
+                <div class="server-item">
+                    <div class="server-icon">G</div>
+                    <div class="server-info">
+                        <div class="server-name">Григорий Елескин</div>
+                        <div class="server-status">Онлайн</div>
+                    </div>
+                </div>
+                <div class="server-item">
+                    <div class="server-icon">A</div>
+                    <div class="server-info">
+                        <div class="server-name">Aifory Pro</div>
+                        <div class="server-status">Онлайн</div>
+                    </div>
+                </div>
+                <div class="server-item">
+                    <div class="server-icon">S</div>
+                    <div class="server-info">
+                        <div class="server-name">Sutochno Unofficial</div>
+                        <div class="server-status">Онлайн</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="channel-list">
+                <div class="channel-header">Каналы</div>
+                <div class="channel-item">
+                    <div class="channel-icon">#</div>
+                    <div class="channel-name">general</div>
+                </div>
+                <div class="channel-item">
+                    <div class="channel-icon">#</div>
+                    <div class="channel-name">random</div>
+                </div>
+                <div class="channel-item">
+                    <div class="channel-icon">#</div>
+                    <div class="channel-name">help</div>
+                </div>
+            </div>
+
+            <div class="dm-list">
+                <div class="channel-header">Прямые сообщения</div>
+                <div class="channel-item">
+                    <div class="channel-icon">👤</div>
+                    <div class="channel-name">Валера Головачук</div>
+                </div>
+                <div class="channel-item">
+                    <div class="channel-icon">👤</div>
+                    <div class="channel-name">Ксюша & Марк Трамплин</div>
+                </div>
+            </div>
+
+            <div class="user-list">
+                <div class="channel-header">Пользователи</div>
+                <div class="channel-item">
+                    <div class="channel-icon">👤</div>
+                    <div class="channel-name">Perplexity research</div>
+                </div>
+                <div class="channel-item">
+                    <div class="channel-icon">👤</div>
+                    <div class="channel-name">Женя 😊</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            <div class="chat-header">
+                <img src="https://via.placeholder.com/32" alt="Chat Avatar" class="chat-avatar">
+                <div class="chat-info">
+                    <div class="chat-name">Григорий Елескин</div>
+                    <div class="chat-status">Онлайн</div>
+                </div>
+                <div class="chat-actions">
+                    <div class="action-btn">🔍</div>
+                    <div class="action-btn">⚙️</div>
+                </div>
+            </div>
+
+            <div class="chat-messages">
+                <div class="message">
+                    <div class="message-header">
+                        <img src="https://via.placeholder.com/32" alt="Message Avatar" class="message-avatar">
+                        <div class="message-info">
+                            <div class="message-author">Григорий Елескин</div>
+                            <div class="message-time">03:14</div>
+                        </div>
+                    </div>
+                    <div class="message-content">
+                        Я сделал прокси на Питоне для проксирования openrouter в claude code
+                        <br>
+                        С полной поддержкой tool calling, учитывает cache механизмы,
+                        использует серы из openrouter и в целом работает гораздо стабильнее claude-code-proxy
+                        <br><br>
+                        В том числе можно вызывать саб агентов с другими моделями из openrouter
+                        <br><br>
+                        Выложу позже на гитхаб, gpt 5.2 сейчас дорабатывает его в claude code
+                    </div>
+                </div>
+
+                <div class="message">
+                    <div class="message-header">
+                        <img src="https://via.placeholder.com/32" alt="Message Avatar" class="message-avatar">
+                        <div class="message-info">
+                            <div class="message-author">Григорий Елескин</div>
+                            <div class="message-time">03:14</div>
+                        </div>
+                    </div>
+                    <div class="message-content">
+                        <div class="message-media">
+                            <img src="https://via.placeholder.com/400x200/7289da/ffffff?text=GPT-5.2+Introduction" alt="GPT-5.2" class="message-image">
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="chat-input">
+                <input type="text" class="input-field" placeholder="Сообщение #general">
+                <div class="input-actions">
+                    <div class="input-action">📷</div>
+                    <div class="input-action">🎤</div>
+                    <div class="input-action">➕</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
