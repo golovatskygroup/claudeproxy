@@ -647,27 +647,46 @@ def inject_cache_control_for_anthropic(
     import copy
     messages = copy.deepcopy(messages)
 
-    # Helper to wrap string content with cache_control
-    def wrap_with_cache_control(content: Any) -> list:
-        """Convert content to array format with cache_control on last block."""
+    def _is_nonempty_text(s: Any) -> bool:
+        return isinstance(s, str) and bool(s.strip())
+
+    # Helper: wrap content to array and add cache_control to the last cacheable block.
+    def wrap_with_cache_control(content: Any) -> Any:
+        """
+        Ensure `content` is an array of blocks and add cache_control to the last
+        cacheable block (text/image/document/tool_use/tool_result).
+
+        Note: Empty text blocks cannot be cached.
+        """
         if isinstance(content, str):
-            return [{
-                "type": "text",
-                "text": content,
-                "cache_control": {"type": "ephemeral"}
-            }]
-        elif isinstance(content, list):
-            # Content is already an array, add cache_control to last text block
-            if content:
-                for i in range(len(content) - 1, -1, -1):
-                    block = content[i]
-                    if isinstance(block, dict) and block.get("type") == "text":
+            if not content.strip():
+                return content
+            return [
+                {
+                    "type": "text",
+                    "text": content,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        if isinstance(content, list):
+            # Content is already an array, add cache_control to the last cacheable block.
+            for i in range(len(content) - 1, -1, -1):
+                block = content[i]
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    if _is_nonempty_text(block.get("text", "")):
                         block["cache_control"] = {"type": "ephemeral"}
                         break
+                    continue
+                # Other top-level blocks are cacheable (image/document/tool_use/tool_result/etc).
+                block["cache_control"] = {"type": "ephemeral"}
+                break
             return content
         return content
 
-    # 1. Add cache_control to system message
+    # 1) Add cache_control to system message (helps cache long instructions/context).
     for msg in messages:
         if msg.get("role") == "system":
             content = msg.get("content")
@@ -675,18 +694,31 @@ def inject_cache_control_for_anthropic(
                 msg["content"] = wrap_with_cache_control(content)
             break
 
-    # 2. Add cache_control to last 2 user messages
-    user_count = 0
+    # 2) Add cache_control to the last message with cacheable content.
+    # This is critical for tool loops: it lets the cache "advance" as tool calls/results
+    # are appended, instead of staying stuck at the system prompt.
     for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content")
-            if content:
-                msg["content"] = wrap_with_cache_control(content)
-            user_count += 1
-            if user_count >= 2:
-                break
+        content = msg.get("content")
+        if not content:
+            continue
+        if isinstance(content, str) and not content.strip():
+            continue
+        if isinstance(content, list):
+            # Must have at least one cacheable block.
+            has_cacheable_block = any(
+                isinstance(b, dict)
+                and (
+                    (b.get("type") == "text" and _is_nonempty_text(b.get("text", "")))
+                    or (b.get("type") != "text")
+                )
+                for b in content
+            )
+            if not has_cacheable_block:
+                continue
+        msg["content"] = wrap_with_cache_control(content)
+        break
 
-    # 3. Add cache_control to last tool definition
+    # 3) Add cache_control to last tool definition
     if tools:
         tools = copy.deepcopy(tools)
         if tools:
