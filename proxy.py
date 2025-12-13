@@ -116,6 +116,9 @@ PROXY_TOOLS_MAX_ITERS = int(os.environ.get("PROXY_TOOLS_MAX_ITERS", "3"))
 # Debug dump configuration
 DEBUG_DUMP_REQUESTS = os.environ.get("DEBUG_DUMP_REQUESTS", "false").lower() == "true"
 
+# Cache marker debugging (logs only cache_control positions, never full text)
+DEBUG_CACHE_MARKERS = os.environ.get("DEBUG_CACHE_MARKERS", "false").lower() == "true"
+
 # Admin API configuration (Feature E)
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 
@@ -612,6 +615,89 @@ def convert_provider_to_openrouter_format(provider: Optional[dict]) -> Optional[
 
     # OpenRouter expects snake_case, so we just return as-is
     return provider
+
+
+def inject_cache_control_for_anthropic(
+    messages: list,
+    tools: Optional[list],
+    target_model: str,
+) -> tuple[list, Optional[list]]:
+    """
+    Inject cache_control breakpoints for Anthropic models on OpenRouter.
+
+    OpenRouter requires explicit cache_control markers for Anthropic prompt caching.
+    This function adds cache_control to:
+    1. System message content (if present)
+    2. Last 2 user messages
+    3. Last tool definition
+
+    Args:
+        messages: List of OpenAI-format messages
+        tools: List of OpenAI-format tools (or None)
+        target_model: The target model slug
+
+    Returns:
+        tuple: (modified_messages, modified_tools)
+    """
+    # Only apply to Anthropic models
+    if not target_model or "anthropic/" not in target_model.lower():
+        return messages, tools
+
+    # Deep copy messages to avoid mutating the original
+    import copy
+    messages = copy.deepcopy(messages)
+
+    # Helper to wrap string content with cache_control
+    def wrap_with_cache_control(content: Any) -> list:
+        """Convert content to array format with cache_control on last block."""
+        if isinstance(content, str):
+            return [{
+                "type": "text",
+                "text": content,
+                "cache_control": {"type": "ephemeral"}
+            }]
+        elif isinstance(content, list):
+            # Content is already an array, add cache_control to last text block
+            if content:
+                for i in range(len(content) - 1, -1, -1):
+                    block = content[i]
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        block["cache_control"] = {"type": "ephemeral"}
+                        break
+            return content
+        return content
+
+    # 1. Add cache_control to system message
+    for msg in messages:
+        if msg.get("role") == "system":
+            content = msg.get("content")
+            if content:
+                msg["content"] = wrap_with_cache_control(content)
+            break
+
+    # 2. Add cache_control to last 2 user messages
+    user_count = 0
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content")
+            if content:
+                msg["content"] = wrap_with_cache_control(content)
+            user_count += 1
+            if user_count >= 2:
+                break
+
+    # 3. Add cache_control to last tool definition
+    if tools:
+        tools = copy.deepcopy(tools)
+        if tools:
+            last_tool = tools[-1]
+            if isinstance(last_tool, dict):
+                # OpenAI format: {"type": "function", "function": {...}}
+                func = last_tool.get("function")
+                if isinstance(func, dict):
+                    func["cache_control"] = {"type": "ephemeral"}
+
+    return messages, tools
 
 
 def get_fallback_models_for_category(anthropic_model: str) -> list[str]:
@@ -2084,23 +2170,47 @@ async def v1_messages(request: Request):
     # Convert to OpenAI format
     openai_messages = anthropic_messages_to_openai_messages(messages, system)
 
-    # Simplify messages content - convert arrays to strings for non-multimodal models
-    # Some providers (like gmicloud) don't support content as array
+    # Convert tools to OpenAI format
+    openai_tools = tools_anthropic_to_openai(tools)
+
+    # Inject cache_control breakpoints for Anthropic models on OpenRouter
+    # This enables prompt caching for system message, last 2 user messages, and tools
+    openai_messages, openai_tools = inject_cache_control_for_anthropic(
+        openai_messages, openai_tools, target_model
+    )
+
+    # Simplify messages content - convert arrays to strings for providers that don't support content arrays.
+    # IMPORTANT: do NOT simplify when cache_control breakpoints are present (Anthropic/OpenRouter prompt caching).
     simplified_messages = []
     for msg in openai_messages:
         new_msg = dict(msg)
         content = new_msg.get("content")
         if isinstance(content, list):
-            # Check if it's just text blocks - simplify to string
             text_only = all(
                 isinstance(block, dict) and block.get("type") == "text"
                 for block in content
             )
-            if text_only:
+            has_cache_control = any(
+                isinstance(block, dict) and ("cache_control" in block)
+                for block in content
+            )
+            if text_only and not has_cache_control:
                 new_msg["content"] = "".join(
                     block.get("text", "") for block in content if isinstance(block, dict)
                 )
         simplified_messages.append(new_msg)
+
+    # Detect prompt caching markers for diagnostics/warnings.
+    has_cache_markers = False
+    cache_markers: list[tuple[int, int, Any]] = []
+    for i, msg in enumerate(simplified_messages):
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for j, block in enumerate(content):
+            if isinstance(block, dict) and ("cache_control" in block):
+                has_cache_markers = True
+                cache_markers.append((i, j, block.get("cache_control")))
 
     # Build OpenRouter request
     openrouter_request = {
@@ -2117,8 +2227,7 @@ async def v1_messages(request: Request):
     if stop_sequences:
         openrouter_request["stop"] = stop_sequences
 
-    # Add tools if present
-    openai_tools = tools_anthropic_to_openai(tools)
+    # Add tools if present (already converted and cache_control injected above)
     if openai_tools:
         openrouter_request["tools"] = openai_tools
 
@@ -2142,6 +2251,22 @@ async def v1_messages(request: Request):
         f"web_search={enable_web_search or OPENROUTER_WEB_ENABLED} "
         f"messages_count={len(openai_messages)}"
     )
+
+    # Optional: log cache_control marker positions for debugging prompt caching.
+    if DEBUG_CACHE_MARKERS and has_cache_markers:
+        markers_str = ", ".join(
+            f"msg[{i}].content[{j}]={cc!r}" for (i, j, cc) in cache_markers
+        )
+        logger.info(
+            f"request_id={request_id} cache_control_markers={markers_str}"
+        )
+
+    # If cache markers exist but we're not targeting Anthropic, warn (caching likely won't work).
+    if has_cache_markers and ("anthropic/" not in (target_model or "")):
+        logger.warning(
+            f"request_id={request_id} cache_control_present_but_non_anthropic_model="
+            f"{target_model} provider={json.dumps(provider) if provider else 'None'}"
+        )
 
     # Request stream_options for usage in streaming mode
     if stream:
