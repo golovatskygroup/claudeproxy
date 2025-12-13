@@ -650,6 +650,66 @@ def inject_cache_control_for_anthropic(
     def _is_nonempty_text(s: Any) -> bool:
         return isinstance(s, str) and bool(s.strip())
 
+    def _iter_cache_control_dicts() -> list[dict]:
+        """Collect references to cache_control dicts (messages + tools)."""
+        refs: list[dict] = []
+        # Messages (includes system role in OpenAI format)
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                cc = block.get("cache_control")
+                if isinstance(cc, dict):
+                    refs.append(cc)
+
+        # Tools (OpenAI format: {"type": "function", "function": {...}})
+        if tools:
+            for t in tools:
+                if not isinstance(t, dict):
+                    continue
+                func = t.get("function")
+                if not isinstance(func, dict):
+                    continue
+                cc = func.get("cache_control")
+                if isinstance(cc, dict):
+                    refs.append(cc)
+
+        return refs
+
+    # Normalize TTL to avoid Anthropic error:
+    # ttl='1h' cache_control blocks must not come after ttl='5m' blocks (order: tools, system, messages).
+    # To make this robust, we pick a single ttl policy for the entire request.
+    cc_refs = _iter_cache_control_dicts()
+    ttl_values: list[str] = []
+    for cc in cc_refs:
+        ttl = cc.get("ttl")
+        if isinstance(ttl, str) and ttl:
+            ttl_values.append(ttl)
+
+    ttl_policy: Optional[str] = None
+    if any(v == "1h" for v in ttl_values):
+        ttl_policy = "1h"
+    elif any(v == "5m" for v in ttl_values):
+        ttl_policy = "5m"
+
+    def _cache_control_obj() -> dict:
+        cc: dict[str, Any] = {"type": "ephemeral"}
+        if ttl_policy:
+            cc["ttl"] = ttl_policy
+        return cc
+
+    def _normalize_cache_control_dict(cc: dict) -> None:
+        # Ensure type matches Anthropic prompt caching.
+        cc["type"] = "ephemeral"
+        if ttl_policy:
+            cc["ttl"] = ttl_policy
+
+    for cc in cc_refs:
+        _normalize_cache_control_dict(cc)
+
     # Helper: wrap content to array and add cache_control to the last cacheable block.
     def wrap_with_cache_control(content: Any) -> Any:
         """
@@ -665,7 +725,7 @@ def inject_cache_control_for_anthropic(
                 {
                     "type": "text",
                     "text": content,
-                    "cache_control": {"type": "ephemeral"},
+                    "cache_control": _cache_control_obj(),
                 }
             ]
         if isinstance(content, list):
@@ -677,34 +737,54 @@ def inject_cache_control_for_anthropic(
                 btype = block.get("type")
                 if btype == "text":
                     if _is_nonempty_text(block.get("text", "")):
-                        block["cache_control"] = {"type": "ephemeral"}
+                        block["cache_control"] = _cache_control_obj()
                         break
                     continue
                 # Other top-level blocks are cacheable (image/document/tool_use/tool_result/etc).
-                block["cache_control"] = {"type": "ephemeral"}
+                block["cache_control"] = _cache_control_obj()
                 break
             return content
         return content
 
-    # 1) Add cache_control to system message (helps cache long instructions/context).
-    for msg in messages:
-        if msg.get("role") == "system":
-            content = msg.get("content")
-            if content:
-                msg["content"] = wrap_with_cache_control(content)
-            break
+    def _message_has_cache_control(msg: dict) -> bool:
+        content = msg.get("content")
+        if isinstance(content, list):
+            return any(isinstance(b, dict) and isinstance(b.get("cache_control"), dict) for b in content)
+        return False
 
-    # 2) Add cache_control to the last message with cacheable content.
-    # This is critical for tool loops: it lets the cache "advance" as tool calls/results
-    # are appended, instead of staying stuck at the system prompt.
+    def _count_cache_controls() -> int:
+        count = 0
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and isinstance(b.get("cache_control"), dict):
+                        count += 1
+        if tools:
+            for t in tools:
+                if not isinstance(t, dict):
+                    continue
+                func = t.get("function")
+                if isinstance(func, dict) and isinstance(func.get("cache_control"), dict):
+                    count += 1
+        return count
+
+    # Anthropic supports up to 4 cache breakpoints. Respect that by only adding markers
+    # when we won't exceed the limit, and prioritize the last message (for tool loops).
+    max_breakpoints = 4
+
+    # 1) Add cache_control to the last message with cacheable content (advance cache across tool loops).
     for msg in reversed(messages):
         content = msg.get("content")
         if not content:
             continue
+        if _message_has_cache_control(msg):
+            break
+        if _count_cache_controls() >= max_breakpoints:
+            break
         if isinstance(content, str) and not content.strip():
             continue
         if isinstance(content, list):
-            # Must have at least one cacheable block.
             has_cacheable_block = any(
                 isinstance(b, dict)
                 and (
@@ -718,6 +798,18 @@ def inject_cache_control_for_anthropic(
         msg["content"] = wrap_with_cache_control(content)
         break
 
+    # 2) Add cache_control to system message (helps cache long instructions/context).
+    for msg in messages:
+        if msg.get("role") == "system":
+            if _message_has_cache_control(msg):
+                break
+            if _count_cache_controls() >= max_breakpoints:
+                break
+            content = msg.get("content")
+            if content:
+                msg["content"] = wrap_with_cache_control(content)
+            break
+
     # 3) Add cache_control to last tool definition
     if tools:
         tools = copy.deepcopy(tools)
@@ -727,7 +819,10 @@ def inject_cache_control_for_anthropic(
                 # OpenAI format: {"type": "function", "function": {...}}
                 func = last_tool.get("function")
                 if isinstance(func, dict):
-                    func["cache_control"] = {"type": "ephemeral"}
+                    if not isinstance(func.get("cache_control"), dict) and _count_cache_controls() < max_breakpoints:
+                        func["cache_control"] = _cache_control_obj()
+                    elif isinstance(func.get("cache_control"), dict):
+                        _normalize_cache_control_dict(func["cache_control"])
 
     return messages, tools
 
