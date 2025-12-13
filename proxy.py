@@ -6,23 +6,23 @@ This proxy translates Anthropic Messages API requests to OpenRouter's OpenAI-com
 and streams responses back in real-time using Server-Sent Events (SSE).
 """
 
-import os
-import json
-import uuid
-import logging
-import time
-import hmac
 import asyncio
-from datetime import datetime, timezone, timedelta
-from typing import AsyncIterator, Optional, Any
+import hmac
+import json
+import logging
+import os
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, AsyncIterator, Optional
 from urllib.parse import urlparse
 
 import httpx
 import tiktoken
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse, Response
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from starlette.middleware.base import BaseHTTPMiddleware
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -39,10 +39,16 @@ PROXY_VERSION = "1.0.0"
 # API Key authentication (comma-separated list of allowed keys)
 # Parsed once at startup for security and performance
 _PROXY_API_KEYS_RAW = os.environ.get("PROXY_API_KEYS", "")
-PROXY_API_KEYS_SET = frozenset(key.strip() for key in _PROXY_API_KEYS_RAW.split(",") if key.strip()) if _PROXY_API_KEYS_RAW else frozenset()
+PROXY_API_KEYS_SET = (
+    frozenset(key.strip() for key in _PROXY_API_KEYS_RAW.split(",") if key.strip())
+    if _PROXY_API_KEYS_RAW
+    else frozenset()
+)
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_BASE_URL = os.environ.get(
+    "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+)
 
 # Model mapping
 TARGET_MODEL_DEFAULT = os.environ.get("TARGET_MODEL_DEFAULT", "openai/gpt-5.2")
@@ -67,7 +73,9 @@ for token in FALLBACK_ON_STATUS_RAW.split(","):
         if 100 <= status_code <= 599:
             _fallback_status_set.add(status_code)
         else:
-            logger.warning(f"FALLBACK_ON_STATUS: ignoring out-of-range status code {status_code} (valid: 100-599)")
+            logger.warning(
+                f"FALLBACK_ON_STATUS: ignoring out-of-range status code {status_code} (valid: 100-599)"
+            )
     except ValueError:
         logger.warning(f"FALLBACK_ON_STATUS: ignoring non-integer token '{token}'")
 FALLBACK_ON_STATUS = frozenset(_fallback_status_set)
@@ -77,13 +85,19 @@ _fallback_max_tries_raw = os.environ.get("FALLBACK_MAX_TRIES", "3")
 try:
     _fallback_max_tries = int(_fallback_max_tries_raw)
     if _fallback_max_tries < 1:
-        logger.warning(f"FALLBACK_MAX_TRIES={_fallback_max_tries} is below minimum (1), clamping to 1")
+        logger.warning(
+            f"FALLBACK_MAX_TRIES={_fallback_max_tries} is below minimum (1), clamping to 1"
+        )
         _fallback_max_tries = 1
     elif _fallback_max_tries > 10:
-        logger.warning(f"FALLBACK_MAX_TRIES={_fallback_max_tries} exceeds maximum (10), clamping to 10")
+        logger.warning(
+            f"FALLBACK_MAX_TRIES={_fallback_max_tries} exceeds maximum (10), clamping to 10"
+        )
         _fallback_max_tries = 10
 except ValueError:
-    logger.warning(f"FALLBACK_MAX_TRIES: invalid value '{_fallback_max_tries_raw}', using default 3")
+    logger.warning(
+        f"FALLBACK_MAX_TRIES: invalid value '{_fallback_max_tries_raw}', using default 3"
+    )
     _fallback_max_tries = 3
 FALLBACK_MAX_TRIES = _fallback_max_tries
 
@@ -95,16 +109,24 @@ OPENROUTER_APP_TITLE = os.environ.get("OPENROUTER_APP_TITLE", "")
 TIMEOUT_S = int(os.environ.get("TIMEOUT_S", "300"))
 
 # OpenRouter web search (disabled by default, use search: prefix or set env var)
-OPENROUTER_WEB_ENABLED = os.environ.get("OPENROUTER_WEB_ENABLED", "false").lower() == "true"
-OPENROUTER_WEB_ENGINE = os.environ.get("OPENROUTER_WEB_ENGINE", "")  # e.g. "exa" or "native"
+OPENROUTER_WEB_ENABLED = (
+    os.environ.get("OPENROUTER_WEB_ENABLED", "false").lower() == "true"
+)
+OPENROUTER_WEB_ENGINE = os.environ.get(
+    "OPENROUTER_WEB_ENGINE", ""
+)  # e.g. "exa" or "native"
 OPENROUTER_WEB_MAX_RESULTS = os.environ.get("OPENROUTER_WEB_MAX_RESULTS", "")  # int
 OPENROUTER_WEB_SEARCH_PROMPT = os.environ.get("OPENROUTER_WEB_SEARCH_PROMPT", "")
-OPENROUTER_WEB_SEARCH_CONTEXT_SIZE = os.environ.get("OPENROUTER_WEB_SEARCH_CONTEXT_SIZE", "")  # low|medium|high
+OPENROUTER_WEB_SEARCH_CONTEXT_SIZE = os.environ.get(
+    "OPENROUTER_WEB_SEARCH_CONTEXT_SIZE", ""
+)  # low|medium|high
 
 # Proxy-side WebSearch tool (Exa) — intercepts Claude Code WebSearch tool calls.
 # If enabled and EXA_API_KEY is set, the proxy will execute WebSearch calls itself
 # and hide the tool loop from the client.
-PROXY_WEBSEARCH_ENABLED = os.environ.get("PROXY_WEBSEARCH_ENABLED", "true").lower() == "true"
+PROXY_WEBSEARCH_ENABLED = (
+    os.environ.get("PROXY_WEBSEARCH_ENABLED", "true").lower() == "true"
+)
 EXA_API_KEY = os.environ.get("EXA_API_KEY", "")
 EXA_BASE_URL = os.environ.get("EXA_BASE_URL", "https://api.exa.ai")
 EXA_MAX_RESULTS = int(os.environ.get("EXA_MAX_RESULTS", "5"))
@@ -118,6 +140,81 @@ DEBUG_DUMP_REQUESTS = os.environ.get("DEBUG_DUMP_REQUESTS", "false").lower() == 
 
 # Cache marker debugging (logs only cache_control positions, never full text)
 DEBUG_CACHE_MARKERS = os.environ.get("DEBUG_CACHE_MARKERS", "false").lower() == "true"
+
+# Gemini / OpenRouter tool-call continuity cache
+#
+# Some Gemini models require passing back provider-generated metadata (e.g.
+# thought_signature / reasoning_details) on subsequent turns when tools are used.
+# Claude Code (Anthropic Messages API client) will not carry these fields for us,
+# so we retain them in-memory keyed by tool_call_id and re-inject them when we
+# see the same tool call in the request history.
+GEMINI_TOOL_META_TTL_S = int(os.environ.get("GEMINI_TOOL_META_TTL_S", "3600"))
+_gemini_tool_meta_cache: dict[str, dict[str, Any]] = {}
+
+
+def _gemini_cache_cleanup(now: Optional[float] = None) -> None:
+    if not _gemini_tool_meta_cache:
+        return
+    if now is None:
+        now = time.time()
+    ttl = max(1, GEMINI_TOOL_META_TTL_S)
+    expired = [
+        k
+        for k, v in _gemini_tool_meta_cache.items()
+        if (now - float(v.get("_ts", 0.0))) > ttl
+    ]
+    for k in expired:
+        _gemini_tool_meta_cache.pop(k, None)
+
+
+def gemini_tool_meta_put(tool_call_id: str, meta: dict[str, Any]) -> None:
+    if not tool_call_id or not isinstance(meta, dict) or not meta:
+        return
+    _gemini_cache_cleanup()
+    entry = _gemini_tool_meta_cache.get(tool_call_id) or {}
+    # Do not store internal keys from callers.
+    for k, v in meta.items():
+        if not isinstance(k, str) or k.startswith("_"):
+            continue
+        entry[k] = v
+    entry["_ts"] = time.time()
+    _gemini_tool_meta_cache[tool_call_id] = entry
+
+
+def gemini_tool_meta_get(tool_call_id: str) -> dict[str, Any]:
+    if not tool_call_id:
+        return {}
+    _gemini_cache_cleanup()
+    entry = _gemini_tool_meta_cache.get(tool_call_id)
+    if not entry:
+        return {}
+    # Return a shallow copy without internal keys.
+    return {k: v for k, v in entry.items() if isinstance(k, str) and not k.startswith("_")}
+
+
+def extract_gemini_tool_meta(tool_call: dict, message: Optional[dict] = None) -> dict[str, Any]:
+    """Best-effort extraction of Gemini continuity metadata from an OpenRouter tool call."""
+    if not isinstance(tool_call, dict):
+        return {}
+
+    meta: dict[str, Any] = {}
+
+    # Most commonly required by Google AI Studio Gemini function calling.
+    if tool_call.get("thought_signature") is not None:
+        meta["thought_signature"] = tool_call.get("thought_signature")
+
+    # Some providers surface it under the function object.
+    func = tool_call.get("function")
+    if isinstance(func, dict) and func.get("thought_signature") is not None:
+        meta.setdefault("thought_signature", func.get("thought_signature"))
+
+    # OpenRouter may require returning reasoning_details blocks verbatim.
+    if tool_call.get("reasoning_details") is not None:
+        meta["reasoning_details"] = tool_call.get("reasoning_details")
+    if isinstance(message, dict) and message.get("reasoning_details") is not None:
+        meta.setdefault("reasoning_details", message.get("reasoning_details"))
+
+    return meta
 
 # Admin API configuration (Feature E)
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
@@ -137,7 +234,9 @@ if QUOTA_CONFIG_FILE:
     try:
         with open(QUOTA_CONFIG_FILE, "r") as f:
             QUOTA_CONFIG = json.load(f)
-        logger.info(f"Loaded quota config from file: {len(QUOTA_CONFIG)} keys configured")
+        logger.info(
+            f"Loaded quota config from file: {len(QUOTA_CONFIG)} keys configured"
+        )
     except FileNotFoundError:
         logger.warning(f"QUOTA_CONFIG_FILE not found: {QUOTA_CONFIG_FILE}")
     except json.JSONDecodeError as e:
@@ -148,7 +247,9 @@ elif QUOTA_CONFIG_JSON:
     # Parse JSON string
     try:
         QUOTA_CONFIG = json.loads(QUOTA_CONFIG_JSON)
-        logger.info(f"Loaded quota config from JSON string: {len(QUOTA_CONFIG)} keys configured")
+        logger.info(
+            f"Loaded quota config from JSON string: {len(QUOTA_CONFIG)} keys configured"
+        )
     except json.JSONDecodeError as e:
         logger.error(f"Invalid QUOTA_CONFIG_JSON: {e}")
     except Exception as e:
@@ -158,6 +259,7 @@ elif QUOTA_CONFIG_JSON:
 quota_state: dict[str, dict[str, Any]] = {}
 quota_state_lock = asyncio.Lock()
 
+
 # Load quota state from file
 def load_quota_state():
     """Load quota state from file."""
@@ -165,9 +267,13 @@ def load_quota_state():
     try:
         with open(QUOTA_STATE_FILE, "r") as f:
             quota_state = json.load(f)
-        logger.info(f"Loaded quota state from {QUOTA_STATE_FILE}: {len(quota_state)} keys")
+        logger.info(
+            f"Loaded quota state from {QUOTA_STATE_FILE}: {len(quota_state)} keys"
+        )
     except FileNotFoundError:
-        logger.info(f"No existing quota state file at {QUOTA_STATE_FILE}, starting fresh")
+        logger.info(
+            f"No existing quota state file at {QUOTA_STATE_FILE}, starting fresh"
+        )
         quota_state = {}
     except json.JSONDecodeError as e:
         logger.error(f"Invalid JSON in quota state file: {e}, starting fresh")
@@ -176,6 +282,7 @@ def load_quota_state():
         logger.error(f"Error loading quota state: {e}, starting fresh")
         quota_state = {}
 
+
 def save_quota_state():
     """Save quota state to file atomically."""
     try:
@@ -183,8 +290,11 @@ def save_quota_state():
         temp_fd, temp_path = None, None
         try:
             import tempfile
+
             state_dir = os.path.dirname(QUOTA_STATE_FILE) or "."
-            temp_fd, temp_path = tempfile.mkstemp(dir=state_dir, prefix=".quota_state_", suffix=".json.tmp")
+            temp_fd, temp_path = tempfile.mkstemp(
+                dir=state_dir, prefix=".quota_state_", suffix=".json.tmp"
+            )
 
             # Write JSON data to temp file
             with os.fdopen(temp_fd, "w") as f:
@@ -217,6 +327,7 @@ def save_quota_state():
     except Exception as e:
         logger.error(f"Error saving quota state: {e}")
 
+
 def get_next_utc_midnight() -> str:
     """Get next UTC midnight as ISO string."""
     now = datetime.now(timezone.utc)
@@ -224,7 +335,10 @@ def get_next_utc_midnight() -> str:
     midnight = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight.isoformat()
 
-async def check_and_reserve_quota(api_key: str, estimated_tokens: int, request_id: str) -> None:
+
+async def check_and_reserve_quota(
+    api_key: str, estimated_tokens: int, request_id: str
+) -> None:
     """
     Check if quota allows this request and reserve tokens.
 
@@ -245,7 +359,7 @@ async def check_and_reserve_quota(api_key: str, estimated_tokens: int, request_i
         if api_key not in quota_state:
             quota_state[api_key] = {
                 "used_tokens": 0,
-                "reset_at": get_next_utc_midnight()
+                "reset_at": get_next_utc_midnight(),
             }
 
         state = quota_state[api_key]
@@ -270,7 +384,7 @@ async def check_and_reserve_quota(api_key: str, estimated_tokens: int, request_i
             )
             raise HTTPException(
                 status_code=429,
-                detail=f"Daily token quota exceeded. Used: {used_tokens}, Limit: {daily_limit}, Resets at: {state['reset_at']}"
+                detail=f"Daily token quota exceeded. Used: {used_tokens}, Limit: {daily_limit}, Resets at: {state['reset_at']}",
             )
 
         # Reserve tokens
@@ -287,7 +401,10 @@ async def check_and_reserve_quota(api_key: str, estimated_tokens: int, request_i
             f"request_id={request_id}"
         )
 
-async def reconcile_quota(api_key: str, estimated_tokens: int, actual_tokens: int, request_id: str) -> None:
+
+async def reconcile_quota(
+    api_key: str, estimated_tokens: int, actual_tokens: int, request_id: str
+) -> None:
     """
     Reconcile quota after actual token usage is known.
 
@@ -323,7 +440,7 @@ async def reconcile_quota(api_key: str, estimated_tokens: int, actual_tokens: in
                 logger.warning(
                     f"Large quota reconcile adjustment detected | "
                     f"estimated={estimated_tokens} actual={actual_tokens} "
-                    f"adjustment={adjustment:+d} ({adjustment_ratio*100:.1f}% of limit) "
+                    f"adjustment={adjustment:+d} ({adjustment_ratio * 100:.1f}% of limit) "
                     f"request_id={request_id}"
                 )
 
@@ -332,11 +449,13 @@ async def reconcile_quota(api_key: str, estimated_tokens: int, actual_tokens: in
             f"adjustment={adjustment:+d} new_used={state['used_tokens']} request_id={request_id}"
         )
 
+
 def mask_api_key(api_key: str) -> str:
     """Mask API key for display (show first 8 chars)."""
     if len(api_key) <= 8:
         return "***"
     return api_key[:8] + "..." + ("*" * (len(api_key) - 8))
+
 
 def check_admin_key(request: Request) -> None:
     """
@@ -347,23 +466,17 @@ def check_admin_key(request: Request) -> None:
     """
     if not ADMIN_API_KEY:
         raise HTTPException(
-            status_code=500,
-            detail="Admin API not configured (ADMIN_API_KEY not set)"
+            status_code=500, detail="Admin API not configured (ADMIN_API_KEY not set)"
         )
 
     admin_key = request.headers.get("X-Admin-Key")
     if not admin_key:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing X-Admin-Key header"
-        )
+        raise HTTPException(status_code=401, detail="Missing X-Admin-Key header")
 
     # Constant-time comparison to prevent timing attacks
     if not hmac.compare_digest(admin_key, ADMIN_API_KEY):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid X-Admin-Key"
-        )
+        raise HTTPException(status_code=401, detail="Invalid X-Admin-Key")
+
 
 # Load quota state at startup
 if QUOTA_CONFIG:
@@ -376,23 +489,17 @@ if QUOTA_CONFIG:
 
 # Request counter by endpoint and status
 request_counter = Counter(
-    'proxy_requests_total',
-    'Total number of requests',
-    ['endpoint', 'status']
+    "proxy_requests_total", "Total number of requests", ["endpoint", "status"]
 )
 
 # Request latency histogram by endpoint
 request_latency = Histogram(
-    'proxy_request_duration_seconds',
-    'Request latency in seconds',
-    ['endpoint']
+    "proxy_request_duration_seconds", "Request latency in seconds", ["endpoint"]
 )
 
 # Error counter by endpoint
 error_counter = Counter(
-    'proxy_errors_total',
-    'Total number of errors',
-    ['endpoint', 'error_type']
+    "proxy_errors_total", "Total number of errors", ["endpoint", "error_type"]
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -413,6 +520,7 @@ app = FastAPI(title="Anthropic to OpenRouter Proxy", version="1.0.0")
 # ─────────────────────────────────────────────────────────────────────────────
 # API Key Authentication Middleware
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class APIKeyAuthMiddleware(BaseHTTPMiddleware):
     """
@@ -451,10 +559,10 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
                     "type": "error",
                     "error": {
                         "type": "configuration_error",
-                        "message": "Server authentication is not configured. Please contact the administrator."
-                    }
+                        "message": "Server authentication is not configured. Please contact the administrator.",
+                    },
                 },
-                headers={"X-Request-Id": request_id}
+                headers={"X-Request-Id": request_id},
             )
 
         # Get X-API-Key header
@@ -476,18 +584,17 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
                     "type": "error",
                     "error": {
                         "type": "authentication_error",
-                        "message": "Missing X-API-Key header"
-                    }
+                        "message": "Missing X-API-Key header",
+                    },
                 },
-                headers={"X-Request-Id": request_id}
+                headers={"X-Request-Id": request_id},
             )
 
         # Validate API key using constant-time comparison to prevent timing attacks
         # Check ALL keys without early exit to ensure constant-time operation across the key set
         # (prevents leaking the number of keys or their position via timing side-channels)
         matches = [
-            hmac.compare_digest(api_key, valid_key)
-            for valid_key in PROXY_API_KEYS_SET
+            hmac.compare_digest(api_key, valid_key) for valid_key in PROXY_API_KEYS_SET
         ]
         is_valid = any(matches)
 
@@ -503,10 +610,10 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
                     "type": "error",
                     "error": {
                         "type": "authentication_error",
-                        "message": "Invalid X-API-Key"
-                    }
+                        "message": "Invalid X-API-Key",
+                    },
                 },
-                headers={"X-Request-Id": request_id}
+                headers={"X-Request-Id": request_id},
             )
 
         # API key is valid, store it in request.state for quota tracking
@@ -524,37 +631,42 @@ app.add_middleware(APIKeyAuthMiddleware)
 # HTTPException handler - Attach X-Request-Id to error responses
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     """
     Global HTTPException handler that ensures X-Request-Id header is always included.
     """
     # Get request_id from request.state if set by middleware, otherwise generate new one
-    request_id = getattr(request.state, "request_id", None) or get_or_generate_request_id(request)
+    request_id = getattr(
+        request.state, "request_id", None
+    ) or get_or_generate_request_id(request)
 
     return JSONResponse(
         status_code=exc.status_code,
         content={
             "type": "error",
-            "error": {
-                "type": "api_error",
-                "message": exc.detail
-            }
+            "error": {"type": "api_error", "message": exc.detail},
         },
-        headers={"X-Request-Id": request_id}
+        headers={"X-Request-Id": request_id},
     )
 
 
 # Log startup configuration (security info)
 if PROXY_API_KEYS_SET:
-    logger.info(f"Proxy authentication enabled: {len(PROXY_API_KEYS_SET)} API key(s) loaded")
+    logger.info(
+        f"Proxy authentication enabled: {len(PROXY_API_KEYS_SET)} API key(s) loaded"
+    )
 else:
-    logger.warning("PROXY_API_KEYS not configured - all requests except /health will be rejected (fail-closed mode)")
+    logger.warning(
+        "PROXY_API_KEYS not configured - all requests except /health will be rejected (fail-closed mode)"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper functions
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def get_or_generate_request_id(request: Request) -> str:
     """Get X-Request-Id from request headers or generate a new one."""
@@ -645,6 +757,7 @@ def inject_cache_control_for_anthropic(
 
     # Deep copy messages to avoid mutating the original
     import copy
+
     messages = copy.deepcopy(messages)
 
     def _is_nonempty_text(s: Any) -> bool:
@@ -749,7 +862,10 @@ def inject_cache_control_for_anthropic(
     def _message_has_cache_control(msg: dict) -> bool:
         content = msg.get("content")
         if isinstance(content, list):
-            return any(isinstance(b, dict) and isinstance(b.get("cache_control"), dict) for b in content)
+            return any(
+                isinstance(b, dict) and isinstance(b.get("cache_control"), dict)
+                for b in content
+            )
         return False
 
     def _count_cache_controls() -> int:
@@ -765,7 +881,9 @@ def inject_cache_control_for_anthropic(
                 if not isinstance(t, dict):
                     continue
                 func = t.get("function")
-                if isinstance(func, dict) and isinstance(func.get("cache_control"), dict):
+                if isinstance(func, dict) and isinstance(
+                    func.get("cache_control"), dict
+                ):
                     count += 1
         return count
 
@@ -819,7 +937,10 @@ def inject_cache_control_for_anthropic(
                 # OpenAI format: {"type": "function", "function": {...}}
                 func = last_tool.get("function")
                 if isinstance(func, dict):
-                    if not isinstance(func.get("cache_control"), dict) and _count_cache_controls() < max_breakpoints:
+                    if (
+                        not isinstance(func.get("cache_control"), dict)
+                        and _count_cache_controls() < max_breakpoints
+                    ):
                         func["cache_control"] = _cache_control_obj()
                     elif isinstance(func.get("cache_control"), dict):
                         _normalize_cache_control_dict(func["cache_control"])
@@ -887,7 +1008,7 @@ def pick_target_model(anthropic_model: str) -> tuple[str, Optional[dict], bool]:
             # Example: "gmicloud/fp8" is the complete provider slug, not "gmicloud" + quantization "fp8"
             provider_info = {
                 "order": [suffix],  # Use the full provider slug: "gmicloud/fp8"
-                "allow_fallbacks": False  # Disable fallbacks when specific provider requested
+                "allow_fallbacks": False,  # Disable fallbacks when specific provider requested
             }
             anthropic_model = base_model
         elif suffix in ["thinking", "nitro", "floor", "extended", "online"]:
@@ -906,7 +1027,7 @@ def pick_target_model(anthropic_model: str) -> tuple[str, Optional[dict], bool]:
             # Other suffixes might be provider names
             provider_info = {
                 "order": [suffix],
-                "allow_fallbacks": False  # Disable fallbacks when specific provider requested
+                "allow_fallbacks": False,  # Disable fallbacks when specific provider requested
             }
             anthropic_model = base_model
 
@@ -984,7 +1105,9 @@ def _count_tokens_openai_messages(model: str, messages: list) -> int:
         else:
             total += len(enc.encode(str(content)))
         if "tool_calls" in m:
-            total += len(enc.encode(json.dumps(m.get("tool_calls"), ensure_ascii=False)))
+            total += len(
+                enc.encode(json.dumps(m.get("tool_calls"), ensure_ascii=False))
+            )
     return total
 
 
@@ -1006,10 +1129,9 @@ def count_anthropic_request_tokens(body: dict) -> int:
     # Use the *target* model slug for tokenizer selection if possible.
     target_model, _, _ = pick_target_model(anthropic_model)
 
-    return (
-        _count_tokens_openai_messages(target_model, openai_messages)
-        + _count_tokens_tools(target_model, tools_anthropic_to_openai(tools))
-    )
+    return _count_tokens_openai_messages(
+        target_model, openai_messages
+    ) + _count_tokens_tools(target_model, tools_anthropic_to_openai(tools))
 
 
 def anthropic_content_to_openai_user_content(content: Any) -> Any:
@@ -1045,19 +1167,19 @@ def anthropic_content_to_openai_user_content(content: Any) -> Any:
                 if source.get("type") == "base64":
                     media_type = source.get("media_type", "image/png")
                     data = source.get("data", "")
-                    result.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{media_type};base64,{data}"
+                    result.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{media_type};base64,{data}"},
                         }
-                    })
+                    )
                 elif source.get("type") == "url":
-                    result.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": source.get("url", "")
+                    result.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": source.get("url", "")},
                         }
-                    })
+                    )
 
             elif block_type == "tool_result":
                 # Tool results are handled separately in message conversion
@@ -1106,8 +1228,8 @@ def tools_anthropic_to_openai(tools: Optional[list]) -> Optional[list]:
             "function": {
                 "name": tool_name,
                 "description": tool.get("description", ""),
-                "parameters": input_schema
-            }
+                "parameters": input_schema,
+            },
         }
         openai_tools.append(openai_tool)
 
@@ -1135,15 +1257,84 @@ def tool_choice_anthropic_to_openai(tool_choice: Optional[Any]) -> Optional[Any]
         elif choice_type == "tool":
             return {
                 "type": "function",
-                "function": {"name": tool_choice.get("name", "")}
+                "function": {"name": tool_choice.get("name", "")},
             }
 
     return tool_choice
 
 
+def normalize_tool_call_ids_for_kimi(messages: list) -> list:
+    """
+    Normalize tool_call_id format for Kimi K2 models.
+
+    Kimi K2 expects all tool call IDs in historical messages to follow the format
+    `functions.func_name:idx`. If IDs are in a different format (e.g., `toolu_01234abc`),
+    the model may generate incorrect tool call IDs, resulting in parsing failures.
+
+    This function:
+    1. Renames tool_call IDs in assistant messages to `functions.{func_name}:{idx}`
+    2. Updates corresponding tool_call_id references in tool response messages
+
+    See: https://github.com/MoonshotAI/K2-Vendor-Verifier
+    """
+    # Build a mapping from old tool_call_id to new normalized ID
+    id_mapping: dict[str, str] = {}
+    tool_call_counter: dict[str, int] = {}  # Track index per function name
+
+    # First pass: collect all tool_calls from assistant messages and build mapping
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not tool_calls:
+            continue
+        for tc in tool_calls:
+            old_id = tc.get("id", "")
+            if not old_id:
+                continue
+            # Extract function name
+            func = tc.get("function", {})
+            func_name = func.get("name", "unknown")
+            # Get next index for this function
+            idx = tool_call_counter.get(func_name, 0)
+            tool_call_counter[func_name] = idx + 1
+            # Create new ID in Kimi format
+            new_id = f"functions.{func_name}:{idx}"
+            id_mapping[old_id] = new_id
+
+    # If no tool calls found, return messages unchanged
+    if not id_mapping:
+        return messages
+
+    # Second pass: apply the mapping to all messages
+    normalized_messages = []
+    for msg in messages:
+        new_msg = dict(msg)
+
+        # Update tool_calls in assistant messages
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            new_tool_calls = []
+            for tc in msg["tool_calls"]:
+                new_tc = dict(tc)
+                old_id = tc.get("id", "")
+                if old_id in id_mapping:
+                    new_tc["id"] = id_mapping[old_id]
+                new_tool_calls.append(new_tc)
+            new_msg["tool_calls"] = new_tool_calls
+
+        # Update tool_call_id in tool response messages
+        elif msg.get("role") == "tool":
+            old_id = msg.get("tool_call_id", "")
+            if old_id in id_mapping:
+                new_msg["tool_call_id"] = id_mapping[old_id]
+
+        normalized_messages.append(new_msg)
+
+    return normalized_messages
+
+
 def anthropic_messages_to_openai_messages(
-    messages: list,
-    system: Optional[str] = None
+    messages: list, system: Optional[str] = None
 ) -> list:
     """
     Convert Anthropic messages format to OpenAI messages format.
@@ -1158,10 +1349,12 @@ def anthropic_messages_to_openai_messages(
             # Anthropic allows system as list of content blocks.
             # Preserve block structure so OpenRouter prompt caching breakpoints
             # (cache_control) can survive.
-            openai_messages.append({
-                "role": "system",
-                "content": anthropic_content_to_openai_user_content(system)
-            })
+            openai_messages.append(
+                {
+                    "role": "system",
+                    "content": anthropic_content_to_openai_user_content(system),
+                }
+            )
 
     for msg in messages:
         role = msg.get("role", "user")
@@ -1171,15 +1364,27 @@ def anthropic_messages_to_openai_messages(
             # Handle user messages with potential tool results
             if isinstance(content, list):
                 # Check for tool_result blocks
-                tool_results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
-                other_content = [b for b in content if not (isinstance(b, dict) and b.get("type") == "tool_result")]
+                tool_results = [
+                    b
+                    for b in content
+                    if isinstance(b, dict) and b.get("type") == "tool_result"
+                ]
+                other_content = [
+                    b
+                    for b in content
+                    if not (isinstance(b, dict) and b.get("type") == "tool_result")
+                ]
 
                 # First add any non-tool-result content as user message
                 if other_content:
-                    openai_messages.append({
-                        "role": "user",
-                        "content": anthropic_content_to_openai_user_content(other_content)
-                    })
+                    openai_messages.append(
+                        {
+                            "role": "user",
+                            "content": anthropic_content_to_openai_user_content(
+                                other_content
+                            ),
+                        }
+                    )
 
                 # Then add tool results as tool messages
                 for tr in tool_results:
@@ -1187,18 +1392,26 @@ def anthropic_messages_to_openai_messages(
                     if isinstance(tool_content, list):
                         # Prefer preserving structured content; OpenAI tool messages accept
                         # either string content or (for newer APIs) content arrays.
-                        tool_content = anthropic_content_to_openai_user_content(tool_content)
+                        tool_content = anthropic_content_to_openai_user_content(
+                            tool_content
+                        )
 
-                    openai_messages.append({
-                        "role": "tool",
-                        "tool_call_id": tr.get("tool_use_id", ""),
-                        "content": tool_content if isinstance(tool_content, (str, list)) else str(tool_content)
-                    })
+                    openai_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tr.get("tool_use_id", ""),
+                            "content": tool_content
+                            if isinstance(tool_content, (str, list))
+                            else str(tool_content),
+                        }
+                    )
             else:
-                openai_messages.append({
-                    "role": "user",
-                    "content": anthropic_content_to_openai_user_content(content)
-                })
+                openai_messages.append(
+                    {
+                        "role": "user",
+                        "content": anthropic_content_to_openai_user_content(content),
+                    }
+                )
 
         elif role == "assistant":
             # Handle assistant messages with potential tool use
@@ -1211,14 +1424,35 @@ def anthropic_messages_to_openai_messages(
                         if block.get("type") == "text":
                             text_parts.append(block.get("text", ""))
                         elif block.get("type") == "tool_use":
-                            tool_calls.append({
-                                "id": block.get("id", ""),
+                            tc_id = block.get("id", "")
+                            tc = {
+                                "id": tc_id,
                                 "type": "function",
                                 "function": {
                                     "name": block.get("name", ""),
-                                    "arguments": json.dumps(block.get("input", {}))
-                                }
-                            })
+                                    "arguments": json.dumps(block.get("input", {})),
+                                },
+                            }
+
+                            # Re-inject Gemini/OpenRouter continuity metadata if we have it.
+                            # This is needed for some Gemini reasoning models when tools are used.
+                            try:
+                                meta = gemini_tool_meta_get(tc_id)
+                                sig = meta.get("thought_signature")
+                                if sig is not None:
+                                    tc["thought_signature"] = sig
+                                    if isinstance(tc.get("function"), dict):
+                                        tc["function"]["thought_signature"] = sig
+
+                                rd = meta.get("reasoning_details")
+                                if rd is not None:
+                                    tc["reasoning_details"] = rd
+                                    if isinstance(tc.get("function"), dict):
+                                        tc["function"]["reasoning_details"] = rd
+                            except Exception:
+                                pass
+
+                            tool_calls.append(tc)
                     elif isinstance(block, str):
                         text_parts.append(block)
 
@@ -1234,10 +1468,7 @@ def anthropic_messages_to_openai_messages(
 
                 openai_messages.append(assistant_msg)
             else:
-                openai_messages.append({
-                    "role": "assistant",
-                    "content": content
-                })
+                openai_messages.append({"role": "assistant", "content": content})
 
     return openai_messages
 
@@ -1260,6 +1491,15 @@ async def exa_search_and_contents(
     if not EXA_API_KEY:
         raise RuntimeError("EXA_API_KEY is not set")
 
+    # Some web search backends reject requests that specify both allowlist and blocklist.
+    # Keep blocklist filtering locally, but avoid sending conflicting filters upstream.
+    blocked_domains_for_payload = blocked_domains
+    if allowed_domains and blocked_domains:
+        logger.warning(
+            "WebSearch received both allowed_domains and blocked_domains; will not send exclude_domains upstream (blocklist will be applied locally)"
+        )
+        blocked_domains_for_payload = None
+
     max_results = max(1, EXA_MAX_RESULTS)
     payload: dict[str, Any] = {
         "query": query,
@@ -1270,11 +1510,14 @@ async def exa_search_and_contents(
     }
     if allowed_domains:
         payload["include_domains"] = allowed_domains
-    if blocked_domains:
-        payload["exclude_domains"] = blocked_domains
+    if blocked_domains_for_payload:
+        payload["exclude_domains"] = blocked_domains_for_payload
 
     url = f"{EXA_BASE_URL.rstrip('/')}/search_and_contents"
-    headers = {"Authorization": f"Bearer {EXA_API_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {EXA_API_KEY}",
+        "Content-Type": "application/json",
+    }
     resp = await client.post(url, headers=headers, json=payload, timeout=TIMEOUT_S)
     resp.raise_for_status()
     data = resp.json()
@@ -1294,7 +1537,9 @@ async def exa_search_and_contents(
             continue
 
         host = urlparse(item_url).hostname or ""
-        if allowed_domains and not any(_domain_matches(host, d) for d in allowed_domains):
+        if allowed_domains and not any(
+            _domain_matches(host, d) for d in allowed_domains
+        ):
             continue
         if blocked_domains and any(_domain_matches(host, d) for d in blocked_domains):
             continue
@@ -1363,10 +1608,30 @@ def build_websearch_tool_result(tool_use_id: str, results: list[dict[str, Any]])
 def openai_response_to_anthropic_message(response: dict, model: str) -> dict:
     """
     Convert OpenAI chat completion response to Anthropic message format.
+    Defense-in-depth: Strip reasoning/thinking tokens from response.
     """
     choice = response.get("choices", [{}])[0]
     message = choice.get("message", {})
     usage = response.get("usage", {})
+
+    # Defense-in-depth: Remove reasoning fields from message (never expose to client)
+    # These fields may be present even when we request exclusion upstream
+    message.pop("reasoning", None)
+    message.pop("reasoning_content", None)
+    message.pop("reasoning_details", None)
+
+    # Cache Gemini/OpenRouter continuity metadata from tool calls so that when the client
+    # later sends tool_result blocks, we can re-inject the required metadata.
+    try:
+        for tc in (message.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            tc_id = tc.get("id") or ""
+            meta = extract_gemini_tool_meta(tc, message)
+            if tc_id and meta:
+                gemini_tool_meta_put(tc_id, meta)
+    except Exception:
+        pass
 
     # Log cache effectiveness if cache metrics are present
     prompt_tokens_details = usage.get("prompt_tokens_details", {})
@@ -1384,10 +1649,7 @@ def openai_response_to_anthropic_message(response: dict, model: str) -> dict:
 
     # Handle text content
     if message.get("content"):
-        content.append({
-            "type": "text",
-            "text": message["content"]
-        })
+        content.append({"type": "text", "text": message["content"]})
 
     # Handle tool calls
     tool_calls = message.get("tool_calls", [])
@@ -1398,12 +1660,14 @@ def openai_response_to_anthropic_message(response: dict, model: str) -> dict:
         except json.JSONDecodeError:
             args = {}
 
-        content.append({
-            "type": "tool_use",
-            "id": tc.get("id", str(uuid.uuid4())),
-            "name": func.get("name", ""),
-            "input": args
-        })
+        content.append(
+            {
+                "type": "tool_use",
+                "id": tc.get("id", str(uuid.uuid4())),
+                "name": func.get("name", ""),
+                "input": args,
+            }
+        )
 
     # Determine stop reason
     finish_reason = choice.get("finish_reason", "end_turn")
@@ -1412,7 +1676,7 @@ def openai_response_to_anthropic_message(response: dict, model: str) -> dict:
     # Build usage object with cache metrics if available
     usage_obj = {
         "input_tokens": usage.get("prompt_tokens", 0),
-        "output_tokens": usage.get("completion_tokens", 0)
+        "output_tokens": usage.get("completion_tokens", 0),
     }
 
     # Add cache metrics if present (OpenRouter/OpenAI format)
@@ -1420,10 +1684,14 @@ def openai_response_to_anthropic_message(response: dict, model: str) -> dict:
     if prompt_tokens_details:
         # OpenAI uses cached_tokens for cache reads
         if "cached_tokens" in prompt_tokens_details:
-            usage_obj["cache_read_input_tokens"] = prompt_tokens_details["cached_tokens"]
+            usage_obj["cache_read_input_tokens"] = prompt_tokens_details[
+                "cached_tokens"
+            ]
         # Calculate cache creation tokens (tokens that were cached but not read from cache)
         # This is an approximation based on total prompt tokens minus cached reads
-        cache_creation = usage.get("prompt_tokens", 0) - prompt_tokens_details.get("cached_tokens", 0)
+        cache_creation = usage.get("prompt_tokens", 0) - prompt_tokens_details.get(
+            "cached_tokens", 0
+        )
         if cache_creation > 0:
             usage_obj["cache_creation_input_tokens"] = cache_creation
 
@@ -1435,7 +1703,7 @@ def openai_response_to_anthropic_message(response: dict, model: str) -> dict:
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": None,
-        "usage": usage_obj
+        "usage": usage_obj,
     }
 
 
@@ -1475,6 +1743,7 @@ def sse_event(event: str, data: Any) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # SSE Parser for OpenRouter stream
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 async def iter_sse_data_lines(response: httpx.Response) -> AsyncIterator[str]:
     """
@@ -1526,12 +1795,13 @@ async def iter_sse_data_lines(response: httpx.Response) -> AsyncIterator[str]:
 # Streaming handler
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 async def stream_openrouter_to_anthropic(
     client: httpx.AsyncClient,
     openrouter_request: dict,
     anthropic_model: str,
     request_id: str,
-    fallback_models: Optional[list[str]] = None
+    fallback_models: Optional[list[str]] = None,
 ) -> AsyncIterator[tuple[str, Optional[dict]]]:
     """
     Stream OpenRouter response and convert to Anthropic SSE format in real-time.
@@ -1568,7 +1838,7 @@ async def stream_openrouter_to_anthropic(
     # Prepare model list: primary model + fallbacks
     models_to_try = [openrouter_request["model"]]
     if fallback_models:
-        models_to_try.extend(fallback_models[:FALLBACK_MAX_TRIES - 1])
+        models_to_try.extend(fallback_models[: FALLBACK_MAX_TRIES - 1])
 
     # State tracking for streaming
     message_id = f"msg_{uuid.uuid4().hex}"
@@ -1599,9 +1869,8 @@ async def stream_openrouter_to_anthropic(
                 f"{OPENROUTER_BASE_URL}/chat/completions",
                 headers=headers,
                 json=current_request,
-                timeout=TIMEOUT_S
+                timeout=TIMEOUT_S,
             ) as response:
-
                 # Check status code before reading any data
                 if response.status_code != 200:
                     error_body = await response.aread()
@@ -1612,19 +1881,29 @@ async def stream_openrouter_to_anthropic(
                     )
 
                     # Check if we should fallback
-                    if response.status_code in FALLBACK_ON_STATUS and attempt < len(models_to_try):
-                        last_error = f"OpenRouter returned {response.status_code}: {error_text}"
+                    if response.status_code in FALLBACK_ON_STATUS and attempt < len(
+                        models_to_try
+                    ):
+                        last_error = (
+                            f"OpenRouter returned {response.status_code}: {error_text}"
+                        )
                         continue  # Try next model
 
                     # No fallback, yield error
-                    yield sse_event("error", {
-                        "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": f"OpenRouter returned {response.status_code}: {error_text}",
-                            "request_id": request_id
-                        }
-                    }), None
+                    yield (
+                        sse_event(
+                            "error",
+                            {
+                                "type": "error",
+                                "error": {
+                                    "type": "api_error",
+                                    "message": f"OpenRouter returned {response.status_code}: {error_text}",
+                                    "request_id": request_id,
+                                },
+                            },
+                        ),
+                        None,
+                    )
                     return
 
                 # Successfully opened stream with 200 status
@@ -1637,19 +1916,34 @@ async def stream_openrouter_to_anthropic(
                     try:
                         chunk = json.loads(data_line)
                     except json.JSONDecodeError as e:
-                        logger.warning(f"Failed to parse SSE data: {data_line[:100]}... Error: {e}")
+                        logger.warning(
+                            f"Failed to parse SSE data: {data_line[:100]}... Error: {e}"
+                        )
                         continue
+
+                    # Defense-in-depth: Strip reasoning fields from chunk itself (some providers attach outside delta)
+                    chunk.pop("reasoning", None)
+                    chunk.pop("reasoning_content", None)
+                    chunk.pop("reasoning_details", None)
 
                     # Handle error in chunk
                     if "error" in chunk:
-                        yield sse_event("error", {
-                            "type": "error",
-                            "error": {
-                                "type": "api_error",
-                                "message": chunk["error"].get("message", str(chunk["error"])),
-                                "request_id": request_id,
-                            }
-                        }), None
+                        yield (
+                            sse_event(
+                                "error",
+                                {
+                                    "type": "error",
+                                    "error": {
+                                        "type": "api_error",
+                                        "message": chunk["error"].get(
+                                            "message", str(chunk["error"])
+                                        ),
+                                        "request_id": request_id,
+                                    },
+                                },
+                            ),
+                            None,
+                        )
                         return
 
                     # Extract usage if present
@@ -1662,9 +1956,13 @@ async def stream_openrouter_to_anthropic(
                         prompt_tokens_details = usage.get("prompt_tokens_details", {})
                         if prompt_tokens_details:
                             if "cached_tokens" in prompt_tokens_details:
-                                cache_read_input_tokens = prompt_tokens_details["cached_tokens"]
+                                cache_read_input_tokens = prompt_tokens_details[
+                                    "cached_tokens"
+                                ]
                             # Calculate cache creation tokens
-                            cache_creation = usage.get("prompt_tokens", 0) - prompt_tokens_details.get("cached_tokens", 0)
+                            cache_creation = usage.get(
+                                "prompt_tokens", 0
+                            ) - prompt_tokens_details.get("cached_tokens", 0)
                             if cache_creation > 0:
                                 cache_creation_input_tokens = cache_creation
 
@@ -1677,31 +1975,43 @@ async def stream_openrouter_to_anthropic(
                     delta = choice.get("delta", {})
                     finish_reason = choice.get("finish_reason")
 
+                    # Defense-in-depth: Strip reasoning fields from delta (never expose to client)
+                    delta.pop("reasoning", None)
+                    delta.pop("reasoning_content", None)
+                    delta.pop("reasoning_details", None)
+
                     # Send message_start event on first chunk
                     if not message_started:
                         message_started = True
-                        usage_start = {
-                            "input_tokens": input_tokens,
-                            "output_tokens": 0
-                        }
+                        usage_start = {"input_tokens": input_tokens, "output_tokens": 0}
                         if cache_creation_input_tokens > 0:
-                            usage_start["cache_creation_input_tokens"] = cache_creation_input_tokens
+                            usage_start["cache_creation_input_tokens"] = (
+                                cache_creation_input_tokens
+                            )
                         if cache_read_input_tokens > 0:
-                            usage_start["cache_read_input_tokens"] = cache_read_input_tokens
+                            usage_start["cache_read_input_tokens"] = (
+                                cache_read_input_tokens
+                            )
 
-                        yield sse_event("message_start", {
-                            "type": "message_start",
-                            "message": {
-                                "id": message_id,
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [],
-                                "model": anthropic_model,
-                                "stop_reason": None,
-                                "stop_sequence": None,
-                                "usage": usage_start
-                            }
-                        }), None
+                        yield (
+                            sse_event(
+                                "message_start",
+                                {
+                                    "type": "message_start",
+                                    "message": {
+                                        "id": message_id,
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [],
+                                        "model": anthropic_model,
+                                        "stop_reason": None,
+                                        "stop_sequence": None,
+                                        "usage": usage_start,
+                                    },
+                                },
+                            ),
+                            None,
+                        )
 
                     # Handle text content delta
                     if "content" in delta and delta["content"]:
@@ -1719,25 +2029,34 @@ async def stream_openrouter_to_anthropic(
                             text_block_index = len(content_blocks)
                             content_blocks.append({"type": "text", "text": ""})
 
-                            yield sse_event("content_block_start", {
-                                "type": "content_block_start",
-                                "index": text_block_index,
-                                "content_block": {
-                                    "type": "text",
-                                    "text": ""
-                                }
-                            }), None
+                            yield (
+                                sse_event(
+                                    "content_block_start",
+                                    {
+                                        "type": "content_block_start",
+                                        "index": text_block_index,
+                                        "content_block": {"type": "text", "text": ""},
+                                    },
+                                ),
+                                None,
+                            )
 
                         # Send text delta
                         content_blocks[text_block_index]["text"] += text_content
-                        yield sse_event("content_block_delta", {
-                            "type": "content_block_delta",
-                            "index": text_block_index,
-                            "delta": {
-                                "type": "text_delta",
-                                "text": text_content
-                            }
-                        }), None
+                        yield (
+                            sse_event(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": text_block_index,
+                                    "delta": {
+                                        "type": "text_delta",
+                                        "text": text_content,
+                                    },
+                                },
+                            ),
+                            None,
+                        )
 
                     # Handle tool calls delta
                     if "tool_calls" in delta:
@@ -1746,7 +2065,9 @@ async def stream_openrouter_to_anthropic(
 
                             if tc_index not in current_tool_calls:
                                 # New tool call - create it
-                                tool_id = tc_delta.get("id", f"toolu_{uuid.uuid4().hex[:24]}")
+                                tool_id = tc_delta.get(
+                                    "id", f"toolu_{uuid.uuid4().hex[:24]}"
+                                )
                                 func = tc_delta.get("function", {})
                                 tool_name = func.get("name", "")
 
@@ -1757,26 +2078,34 @@ async def stream_openrouter_to_anthropic(
                                     "block_index": block_index,
                                     "id": tool_id,
                                     "name": tool_name,
-                                    "arguments": ""
+                                    "arguments": "",
                                 }
 
-                                content_blocks.append({
-                                    "type": "tool_use",
-                                    "id": tool_id,
-                                    "name": tool_name,
-                                    "input": {}
-                                })
-
-                                yield sse_event("content_block_start", {
-                                    "type": "content_block_start",
-                                    "index": block_index,
-                                    "content_block": {
+                                content_blocks.append(
+                                    {
                                         "type": "tool_use",
                                         "id": tool_id,
                                         "name": tool_name,
-                                        "input": {}
+                                        "input": {},
                                     }
-                                }), None
+                                )
+
+                                yield (
+                                    sse_event(
+                                        "content_block_start",
+                                        {
+                                            "type": "content_block_start",
+                                            "index": block_index,
+                                            "content_block": {
+                                                "type": "tool_use",
+                                                "id": tool_id,
+                                                "name": tool_name,
+                                                "input": {},
+                                            },
+                                        },
+                                    ),
+                                    None,
+                                )
 
                             # Handle argument delta
                             func = tc_delta.get("function", {})
@@ -1786,25 +2115,36 @@ async def stream_openrouter_to_anthropic(
                                     tc_info = current_tool_calls[tc_index]
                                     tc_info["arguments"] += arg_delta
 
-                                    yield sse_event("content_block_delta", {
-                                        "type": "content_block_delta",
-                                        "index": tc_info["block_index"],
-                                        "delta": {
-                                            "type": "input_json_delta",
-                                            "partial_json": arg_delta
-                                        }
-                                    }), None
+                                    yield (
+                                        sse_event(
+                                            "content_block_delta",
+                                            {
+                                                "type": "content_block_delta",
+                                                "index": tc_info["block_index"],
+                                                "delta": {
+                                                    "type": "input_json_delta",
+                                                    "partial_json": arg_delta,
+                                                },
+                                            },
+                                        ),
+                                        None,
+                                    )
 
                     # Handle finish reason
                     if finish_reason:
-                        stop_reason = finish_reason_to_anthropic_stop_reason(finish_reason)
+                        stop_reason = finish_reason_to_anthropic_stop_reason(
+                            finish_reason
+                        )
 
                 # Close all content blocks
                 for i in range(len(content_blocks)):
-                    yield sse_event("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": i
-                    }), None
+                    yield (
+                        sse_event(
+                            "content_block_stop",
+                            {"type": "content_block_stop", "index": i},
+                        ),
+                        None,
+                    )
 
                 # Log cache effectiveness if available
                 if cache_read_input_tokens > 0 and input_tokens > 0:
@@ -1815,29 +2155,31 @@ async def stream_openrouter_to_anthropic(
                     )
 
                 # Send message_delta with final stop reason and usage
-                usage_delta = {
-                    "output_tokens": output_tokens
-                }
+                usage_delta = {"output_tokens": output_tokens}
                 # Note: cache metrics are only in message_start, not in message_delta
 
-                yield sse_event("message_delta", {
-                    "type": "message_delta",
-                    "delta": {
-                        "stop_reason": stop_reason or "end_turn",
-                        "stop_sequence": None
-                    },
-                    "usage": usage_delta
-                }), None
+                yield (
+                    sse_event(
+                        "message_delta",
+                        {
+                            "type": "message_delta",
+                            "delta": {
+                                "stop_reason": stop_reason or "end_turn",
+                                "stop_sequence": None,
+                            },
+                            "usage": usage_delta,
+                        },
+                    ),
+                    None,
+                )
 
                 # Send message_stop
-                yield sse_event("message_stop", {
-                    "type": "message_stop"
-                }), None
+                yield sse_event("message_stop", {"type": "message_stop"}), None
 
                 # Yield final usage data for quota reconciliation
                 final_usage = {
                     "input_tokens": input_tokens,
-                    "output_tokens": output_tokens
+                    "output_tokens": output_tokens,
                 }
                 yield "", final_usage
 
@@ -1854,14 +2196,20 @@ async def stream_openrouter_to_anthropic(
                 last_error = f"Request timed out after {TIMEOUT_S} seconds"
                 continue
             # Otherwise yield error
-            yield sse_event("error", {
-                "type": "error",
-                "error": {
-                    "type": "timeout_error",
-                    "message": f"Request timed out after {TIMEOUT_S} seconds",
-                    "request_id": request_id
-                }
-            }), None
+            yield (
+                sse_event(
+                    "error",
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "timeout_error",
+                            "message": f"Request timed out after {TIMEOUT_S} seconds",
+                            "request_id": request_id,
+                        },
+                    },
+                ),
+                None,
+            )
             return
         except httpx.RequestError as e:
             logger.warning(
@@ -1873,26 +2221,38 @@ async def stream_openrouter_to_anthropic(
                 last_error = f"Request failed: {str(e)}"
                 continue
             # Otherwise yield error
-            yield sse_event("error", {
-                "type": "error",
-                "error": {
-                    "type": "api_error",
-                    "message": f"Request failed: {str(e)}",
-                    "request_id": request_id
-                }
-            }), None
+            yield (
+                sse_event(
+                    "error",
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": f"Request failed: {str(e)}",
+                            "request_id": request_id,
+                        },
+                    },
+                ),
+                None,
+            )
             return
 
     # If we exhausted all models without success
     if last_error:
-        yield sse_event("error", {
-            "type": "error",
-            "error": {
-                "type": "api_error",
-                "message": f"All models failed. Last error: {last_error}",
-                "request_id": request_id
-            }
-        }), None
+        yield (
+            sse_event(
+                "error",
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": f"All models failed. Last error: {last_error}",
+                        "request_id": request_id,
+                    },
+                },
+            ),
+            None,
+        )
 
 
 async def openrouter_chat_completion(
@@ -1921,7 +2281,7 @@ async def openrouter_chat_completion(
     # Prepare model list: primary model + fallbacks
     models_to_try = [openrouter_request["model"]]
     if fallback_models:
-        models_to_try.extend(fallback_models[:FALLBACK_MAX_TRIES - 1])
+        models_to_try.extend(fallback_models[: FALLBACK_MAX_TRIES - 1])
 
     last_error = None
     last_status = None
@@ -2049,6 +2409,17 @@ async def run_proxy_tools_loop(
         if non_interceptable:
             return last_response
 
+        # Cache Gemini/OpenRouter continuity metadata from tool calls (e.g. thought_signature)
+        # so we can re-inject it on the follow-up request that carries tool results.
+        try:
+            for tc in tool_calls:
+                tc_id = tc.get("id") or ""
+                meta = extract_gemini_tool_meta(tc, message)
+                if tc_id and meta:
+                    gemini_tool_meta_put(tc_id, meta)
+        except Exception:
+            pass
+
         # Append assistant tool-call message
         messages.append(message)
 
@@ -2065,6 +2436,14 @@ async def run_proxy_tools_loop(
             query = args.get("query") or ""
             allowed = args.get("allowed_domains") or None
             blocked = args.get("blocked_domains") or None
+
+            # Some search backends reject requests that specify both allowlist and blocklist.
+            # Prefer allowlist if both are provided.
+            if allowed and blocked:
+                logger.warning(
+                    "WebSearch received both allowed_domains and blocked_domains; ignoring blocked_domains"
+                )
+                blocked = None
 
             try:
                 results = await exa_search_and_contents(
@@ -2097,10 +2476,14 @@ async def run_proxy_tools_loop(
         request = dict(request)
         request["messages"] = messages
 
-    return last_response or {"choices": [{"message": {"role": "assistant", "content": ""}}]}
+    return last_response or {
+        "choices": [{"message": {"role": "assistant", "content": ""}}]
+    }
 
 
-async def anthropic_sse_from_message(message: dict, anthropic_model: str) -> AsyncIterator[str]:
+async def anthropic_sse_from_message(
+    message: dict, anthropic_model: str
+) -> AsyncIterator[str]:
     """
     Convert a full Anthropic message dict to SSE events.
     Used when we need to precompute the response (e.g., proxy-side tools).
@@ -2112,7 +2495,9 @@ async def anthropic_sse_from_message(message: dict, anthropic_model: str) -> Asy
         "output_tokens": 0,
     }
     if "cache_creation_input_tokens" in usage:
-        usage_start["cache_creation_input_tokens"] = usage["cache_creation_input_tokens"]
+        usage_start["cache_creation_input_tokens"] = usage[
+            "cache_creation_input_tokens"
+        ]
     if "cache_read_input_tokens" in usage:
         usage_start["cache_read_input_tokens"] = usage["cache_read_input_tokens"]
 
@@ -2134,12 +2519,23 @@ async def anthropic_sse_from_message(message: dict, anthropic_model: str) -> Asy
     )
 
     content_blocks = message.get("content") or []
+    # Defense-in-depth: Track actual index after filtering reasoning blocks
+    actual_index = 0
     for i, block in enumerate(content_blocks):
         btype = block.get("type")
+
+        # Defense-in-depth: Drop reasoning/thinking blocks instead of serializing them
+        if btype in ("thinking", "reasoning") or (btype and btype.startswith("reasoning.")):
+            continue  # Skip reasoning blocks entirely
+
         if btype == "text":
             yield sse_event(
                 "content_block_start",
-                {"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}},
+                {
+                    "type": "content_block_start",
+                    "index": actual_index,
+                    "content_block": {"type": "text", "text": ""},
+                },
             )
             text = block.get("text", "")
             if text:
@@ -2147,7 +2543,7 @@ async def anthropic_sse_from_message(message: dict, anthropic_model: str) -> Asy
                     "content_block_delta",
                     {
                         "type": "content_block_delta",
-                        "index": i,
+                        "index": actual_index,
                         "delta": {"type": "text_delta", "text": text},
                     },
                 )
@@ -2156,7 +2552,7 @@ async def anthropic_sse_from_message(message: dict, anthropic_model: str) -> Asy
                 "content_block_start",
                 {
                     "type": "content_block_start",
-                    "index": i,
+                    "index": actual_index,
                     "content_block": {
                         "type": "tool_use",
                         "id": block.get("id", ""),
@@ -2166,21 +2562,31 @@ async def anthropic_sse_from_message(message: dict, anthropic_model: str) -> Asy
                 },
             )
         else:
-            # Fallback: serialize unknown blocks as text.
+            # Fallback: serialize unknown blocks as text (but not reasoning-related ones).
             yield sse_event(
                 "content_block_start",
-                {"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}},
+                {
+                    "type": "content_block_start",
+                    "index": actual_index,
+                    "content_block": {"type": "text", "text": ""},
+                },
             )
             yield sse_event(
                 "content_block_delta",
                 {
                     "type": "content_block_delta",
-                    "index": i,
-                    "delta": {"type": "text_delta", "text": json.dumps(block, ensure_ascii=False)},
+                    "index": actual_index,
+                    "delta": {
+                        "type": "text_delta",
+                        "text": json.dumps(block, ensure_ascii=False),
+                    },
                 },
             )
 
-        yield sse_event("content_block_stop", {"type": "content_block_stop", "index": i})
+        yield sse_event(
+            "content_block_stop", {"type": "content_block_stop", "index": actual_index}
+        )
+        actual_index += 1
 
     yield sse_event(
         "message_delta",
@@ -2196,9 +2602,82 @@ async def anthropic_sse_from_message(message: dict, anthropic_model: str) -> Asy
     yield sse_event("message_stop", {"type": "message_stop"})
 
 
+def process_messages_for_openrouter(
+    messages: list,
+    system: Optional[str],
+    tools: Optional[list],
+    target_model: str,
+    is_kimi_model: bool,
+) -> tuple[list, Optional[list], bool, list]:
+    """
+    Process messages for OpenRouter in a SINGLE PASS.
+    Combines: anthropic->openai conversion, kimi normalization, tools conversion,
+    cache_control injection, simplification, and marker detection.
+
+    Returns:
+        - processed_messages: messages after all transformations
+        - processed_tools: tools after conversion and cache_control
+        - has_cache_markers: whether cache_control markers were found
+        - cache_markers: list of (msg_idx, block_idx, cache_control_obj) tuples
+    """
+    # Step 1: Convert to OpenAI format
+    openai_messages = anthropic_messages_to_openai_messages(messages, system)
+
+    # Step 2: Normalize tool_call_id for Kimi (if needed)
+    if is_kimi_model:
+        openai_messages = normalize_tool_call_ids_for_kimi(openai_messages)
+
+    # Step 3: Convert tools
+    openai_tools = tools_anthropic_to_openai(tools) if tools else None
+
+    # Step 4: Inject cache_control
+    openai_messages, openai_tools = inject_cache_control_for_anthropic(
+        openai_messages, openai_tools, target_model
+    )
+
+    # Step 5: Simplify messages AND detect markers in ONE PASS
+    simplified_messages = []
+    has_cache_markers = False
+    cache_markers = []
+
+    for i, msg in enumerate(openai_messages):
+        new_msg = dict(msg)
+        content = new_msg.get("content")
+
+        # Simplify text-only arrays to strings
+        if isinstance(content, list):
+            text_only = all(
+                isinstance(block, dict) and block.get("type") == "text"
+                for block in content
+            )
+            has_cache_control_local = any(
+                isinstance(block, dict) and ("cache_control" in block)
+                for block in content
+            )
+
+            # Simplify if text-only and no cache_control
+            if text_only and not has_cache_control_local:
+                new_msg["content"] = "".join(
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict)
+                )
+            elif has_cache_control_local:
+                # Detect cache_control markers while iterating
+                for j, block in enumerate(content):
+                    if isinstance(block, dict) and "cache_control" in block:
+                        has_cache_markers = True
+                        cache_markers.append((i, j, block.get("cache_control")))
+
+        simplified_messages.append(new_msg)
+
+    return simplified_messages, openai_tools, has_cache_markers, cache_markers
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # API Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @app.post("/v1/messages")
 async def v1_messages(request: Request):
@@ -2219,18 +2698,21 @@ async def v1_messages(request: Request):
     start_time = time.time()
 
     if not OPENROUTER_API_KEY:
-        error_counter.labels(endpoint='/v1/messages', error_type='configuration_error').inc()
+        error_counter.labels(
+            endpoint="/v1/messages", error_type="configuration_error"
+        ).inc()
         raise HTTPException(
-            status_code=500,
-            detail="OPENROUTER_API_KEY environment variable is not set"
+            status_code=500, detail="OPENROUTER_API_KEY environment variable is not set"
         )
 
     try:
         body = await request.json()
     except Exception as e:
-        error_counter.labels(endpoint='/v1/messages', error_type='invalid_json').inc()
-        request_counter.labels(endpoint='/v1/messages', status='400').inc()
-        request_latency.labels(endpoint='/v1/messages').observe(time.time() - start_time)
+        error_counter.labels(endpoint="/v1/messages", error_type="invalid_json").inc()
+        request_counter.labels(endpoint="/v1/messages", status="400").inc()
+        request_latency.labels(endpoint="/v1/messages").observe(
+            time.time() - start_time
+        )
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
 
     # Extract Anthropic request parameters
@@ -2261,18 +2743,26 @@ async def v1_messages(request: Request):
             await check_and_reserve_quota(api_key, estimated_total_tokens, request_id)
         except HTTPException as e:
             # Quota exceeded, return 429
-            error_counter.labels(endpoint='/v1/messages', error_type='quota_exceeded').inc()
-            request_counter.labels(endpoint='/v1/messages', status='429').inc()
-            request_latency.labels(endpoint='/v1/messages').observe(time.time() - start_time)
+            error_counter.labels(
+                endpoint="/v1/messages", error_type="quota_exceeded"
+            ).inc()
+            request_counter.labels(endpoint="/v1/messages", status="429").inc()
+            request_latency.labels(endpoint="/v1/messages").observe(
+                time.time() - start_time
+            )
             raise
 
     # OpenRouter-specific parameters
     provider = body.get("provider")  # Provider routing object
-    reasoning = body.get("reasoning")  # Reasoning mode
-    include_reasoning = body.get("include_reasoning")  # Include reasoning in response
+    # Note: Accept but ignore client reasoning/include_reasoning params - we will force exclude reasoning
+    # to prevent thinking/reasoning tokens from leaking to the client (defense-in-depth)
+    client_reasoning = body.get("reasoning")  # Client's reasoning mode (ignored)
+    client_include_reasoning = body.get("include_reasoning")  # Client's include_reasoning (ignored)
 
     # Pick target model and extract provider info and web search flag from model name if present
-    target_model, model_provider_info, enable_web_search = pick_target_model(anthropic_model)
+    target_model, model_provider_info, enable_web_search = pick_target_model(
+        anthropic_model
+    )
 
     # Get fallback models for this category (if any)
     fallback_models = get_fallback_models_for_category(anthropic_model)
@@ -2294,50 +2784,23 @@ async def v1_messages(request: Request):
     if provider:
         provider = convert_provider_to_openrouter_format(provider)
 
-    # Convert to OpenAI format
-    openai_messages = anthropic_messages_to_openai_messages(messages, system)
-
-    # Convert tools to OpenAI format
-    openai_tools = tools_anthropic_to_openai(tools)
-
-    # Inject cache_control breakpoints for Anthropic models on OpenRouter
-    # This enables prompt caching for system message, last 2 user messages, and tools
-    openai_messages, openai_tools = inject_cache_control_for_anthropic(
-        openai_messages, openai_tools, target_model
+    # Process messages in a single optimized pass:
+    # - Convert Anthropic -> OpenAI format
+    # - Normalize tool_call_id for Kimi (if needed)
+    # - Convert tools to OpenAI format
+    # - Inject cache_control breakpoints
+    # - Simplify text-only messages
+    # - Detect cache_control markers
+    is_kimi_model = "kimi" in (target_model or "").lower()
+    simplified_messages, openai_tools, has_cache_markers, cache_markers = (
+        process_messages_for_openrouter(
+            messages=messages,
+            system=system,
+            tools=tools,
+            target_model=target_model,
+            is_kimi_model=is_kimi_model,
+        )
     )
-
-    # Simplify messages content - convert arrays to strings for providers that don't support content arrays.
-    # IMPORTANT: do NOT simplify when cache_control breakpoints are present (Anthropic/OpenRouter prompt caching).
-    simplified_messages = []
-    for msg in openai_messages:
-        new_msg = dict(msg)
-        content = new_msg.get("content")
-        if isinstance(content, list):
-            text_only = all(
-                isinstance(block, dict) and block.get("type") == "text"
-                for block in content
-            )
-            has_cache_control = any(
-                isinstance(block, dict) and ("cache_control" in block)
-                for block in content
-            )
-            if text_only and not has_cache_control:
-                new_msg["content"] = "".join(
-                    block.get("text", "") for block in content if isinstance(block, dict)
-                )
-        simplified_messages.append(new_msg)
-
-    # Detect prompt caching markers for diagnostics/warnings.
-    has_cache_markers = False
-    cache_markers: list[tuple[int, int, Any]] = []
-    for i, msg in enumerate(simplified_messages):
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for j, block in enumerate(content):
-            if isinstance(block, dict) and ("cache_control" in block):
-                has_cache_markers = True
-                cache_markers.append((i, j, block.get("cache_control")))
 
     # Build OpenRouter request
     openrouter_request = {
@@ -2366,17 +2829,21 @@ async def v1_messages(request: Request):
     if provider is not None:
         openrouter_request["provider"] = provider
 
-    if reasoning is not None:
-        openrouter_request["reasoning"] = reasoning
-    if include_reasoning is not None:
-        openrouter_request["include_reasoning"] = include_reasoning
+    # Reasoning exclusion strategy:
+    # - If no tools are present (and not in tool loop), we can safely exclude reasoning upstream
+    # - If tools are present, we keep reasoning enabled upstream (for continuity metadata)
+    #   but will filter it out on response-side (defense-in-depth)
+    has_tools = bool(openai_tools)
+    if not has_tools:
+        # Safe to exclude reasoning upstream when no tools are involved
+        openrouter_request["reasoning"] = {"exclude": True}
 
     # Log the request (without message content)
     logger.info(
         f"request_id={request_id} model={target_model} "
         f"provider={json.dumps(provider) if provider else 'None'} "
         f"web_search={enable_web_search or OPENROUTER_WEB_ENABLED} "
-        f"messages_count={len(openai_messages)}"
+        f"messages_count={len(simplified_messages)}"
     )
 
     # Optional: log cache_control marker positions for debugging prompt caching.
@@ -2384,16 +2851,10 @@ async def v1_messages(request: Request):
         markers_str = ", ".join(
             f"msg[{i}].content[{j}]={cc!r}" for (i, j, cc) in cache_markers
         )
-        logger.info(
-            f"request_id={request_id} cache_control_markers={markers_str}"
-        )
+        logger.info(f"request_id={request_id} cache_control_markers={markers_str}")
 
-    # If cache markers exist but we're not targeting Anthropic, warn (caching likely won't work).
-    if has_cache_markers and ("anthropic/" not in (target_model or "")):
-        logger.warning(
-            f"request_id={request_id} cache_control_present_but_non_anthropic_model="
-            f"{target_model} provider={json.dumps(provider) if provider else 'None'}"
-        )
+    # Note: cache_control markers are forwarded to OpenRouter for all models.
+    # OpenRouter handles caching internally and may support it for non-Anthropic models too.
 
     # Request stream_options for usage in streaming mode
     if stream:
@@ -2410,7 +2871,10 @@ async def v1_messages(request: Request):
             try:
                 plugin["max_results"] = int(OPENROUTER_WEB_MAX_RESULTS)
             except ValueError:
-                logger.warning("Invalid OPENROUTER_WEB_MAX_RESULTS=%r (expected int)", OPENROUTER_WEB_MAX_RESULTS)
+                logger.warning(
+                    "Invalid OPENROUTER_WEB_MAX_RESULTS=%r (expected int)",
+                    OPENROUTER_WEB_MAX_RESULTS,
+                )
         if OPENROUTER_WEB_SEARCH_PROMPT:
             plugin["search_prompt"] = OPENROUTER_WEB_SEARCH_PROMPT
 
@@ -2438,7 +2902,7 @@ async def v1_messages(request: Request):
         redacted_upstream_headers = redact_headers_for_debug(headers)
         debug_dump = {
             "request": redacted_request,
-            "upstream_headers": redacted_upstream_headers
+            "upstream_headers": redacted_upstream_headers,
         }
         redacted_json = json.dumps(debug_dump, indent=2, default=str)
         path = "/tmp/last_openrouter_request.json"
@@ -2474,8 +2938,12 @@ async def v1_messages(request: Request):
                         proxy_request["stream"] = False
                         proxy_request.pop("stream_options", None)
                         response_dict = await run_proxy_tools_loop(
-                            client, proxy_request, headers, intercepted_tool_names,
-                            request_id, fallback_models
+                            client,
+                            proxy_request,
+                            headers,
+                            intercepted_tool_names,
+                            request_id,
+                            fallback_models,
                         )
                         anthropic_msg = openai_response_to_anthropic_message(
                             response_dict, anthropic_model
@@ -2489,28 +2957,43 @@ async def v1_messages(request: Request):
                             anthropic_msg, anthropic_model
                         ):
                             yield event
-                    request_counter.labels(endpoint='/v1/messages', status='200').inc()
-                    request_latency.labels(endpoint='/v1/messages').observe(time.time() - start_time)
+                    request_counter.labels(endpoint="/v1/messages", status="200").inc()
+                    request_latency.labels(endpoint="/v1/messages").observe(
+                        time.time() - start_time
+                    )
                 except Exception as e:
-                    error_counter.labels(endpoint='/v1/messages', error_type='streaming_error').inc()
-                    request_counter.labels(endpoint='/v1/messages', status='500').inc()
-                    request_latency.labels(endpoint='/v1/messages').observe(time.time() - start_time)
-                    logger.exception(f"Streaming error in v1_messages (proxy tools): request_id={request_id}")
+                    error_counter.labels(
+                        endpoint="/v1/messages", error_type="streaming_error"
+                    ).inc()
+                    request_counter.labels(endpoint="/v1/messages", status="500").inc()
+                    request_latency.labels(endpoint="/v1/messages").observe(
+                        time.time() - start_time
+                    )
+                    logger.exception(
+                        f"Streaming error in v1_messages (proxy tools): request_id={request_id}"
+                    )
                     # Yield SSE error event instead of re-raising
-                    yield sse_event("error", {
-                        "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": f"Streaming error: {str(e)}",
-                            "request_id": request_id
-                        }
-                    })
+                    yield sse_event(
+                        "error",
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": f"Streaming error: {str(e)}",
+                                "request_id": request_id,
+                            },
+                        },
+                    )
                     return
                 finally:
                     # Reconcile quota after stream completes
-                    if api_key and (actual_input_tokens > 0 or actual_output_tokens > 0):
+                    if api_key and (
+                        actual_input_tokens > 0 or actual_output_tokens > 0
+                    ):
                         actual_total = actual_input_tokens + actual_output_tokens
-                        await reconcile_quota(api_key, estimated_total_tokens, actual_total, request_id)
+                        await reconcile_quota(
+                            api_key, estimated_total_tokens, actual_total, request_id
+                        )
 
             return StreamingResponse(
                 stream_generator(),
@@ -2531,33 +3014,52 @@ async def v1_messages(request: Request):
             try:
                 async with httpx.AsyncClient() as client:
                     async for event, usage in stream_openrouter_to_anthropic(
-                        client, openrouter_request, anthropic_model, request_id, fallback_models
+                        client,
+                        openrouter_request,
+                        anthropic_model,
+                        request_id,
+                        fallback_models,
                     ):
                         # Extract usage from final yield (usage dict returned on last item)
                         if usage is not None:
-                            actual_input_tokens = usage.get("input_tokens", actual_input_tokens)
-                            actual_output_tokens = usage.get("output_tokens", actual_output_tokens)
+                            actual_input_tokens = usage.get(
+                                "input_tokens", actual_input_tokens
+                            )
+                            actual_output_tokens = usage.get(
+                                "output_tokens", actual_output_tokens
+                            )
 
                         # Only yield non-empty events (final usage yield has empty string)
                         if event:
                             yield event
 
-                request_counter.labels(endpoint='/v1/messages', status='200').inc()
-                request_latency.labels(endpoint='/v1/messages').observe(time.time() - start_time)
+                request_counter.labels(endpoint="/v1/messages", status="200").inc()
+                request_latency.labels(endpoint="/v1/messages").observe(
+                    time.time() - start_time
+                )
             except Exception as e:
-                error_counter.labels(endpoint='/v1/messages', error_type='streaming_error').inc()
-                request_counter.labels(endpoint='/v1/messages', status='500').inc()
-                request_latency.labels(endpoint='/v1/messages').observe(time.time() - start_time)
-                logger.exception(f"Streaming error in v1_messages: request_id={request_id}")
+                error_counter.labels(
+                    endpoint="/v1/messages", error_type="streaming_error"
+                ).inc()
+                request_counter.labels(endpoint="/v1/messages", status="500").inc()
+                request_latency.labels(endpoint="/v1/messages").observe(
+                    time.time() - start_time
+                )
+                logger.exception(
+                    f"Streaming error in v1_messages: request_id={request_id}"
+                )
                 # Yield SSE error event instead of re-raising
-                yield sse_event("error", {
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": f"Streaming error: {str(e)}",
-                        "request_id": request_id
-                    }
-                })
+                yield sse_event(
+                    "error",
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": f"Streaming error: {str(e)}",
+                            "request_id": request_id,
+                        },
+                    },
+                )
                 return
             finally:
                 # Reconcile quota after stream completes (always runs, even on parsing failures)
@@ -2566,14 +3068,21 @@ async def v1_messages(request: Request):
                     # Use tracked tokens if available, otherwise fall back to estimate
                     if actual_input_tokens > 0 or actual_output_tokens > 0:
                         actual_total = actual_input_tokens + actual_output_tokens
-                        await reconcile_quota(api_key, estimated_total_tokens, actual_total, request_id)
+                        await reconcile_quota(
+                            api_key, estimated_total_tokens, actual_total, request_id
+                        )
                     else:
                         # Parsing failed - log warning and use estimate as actual
                         logger.warning(
                             f"Failed to extract usage from stream, using estimate as actual | "
                             f"estimated={estimated_total_tokens} request_id={request_id}"
                         )
-                        await reconcile_quota(api_key, estimated_total_tokens, estimated_total_tokens, request_id)
+                        await reconcile_quota(
+                            api_key,
+                            estimated_total_tokens,
+                            estimated_total_tokens,
+                            request_id,
+                        )
 
         return StreamingResponse(
             stream_generator(),
@@ -2594,8 +3103,12 @@ async def v1_messages(request: Request):
                 proxy_request["stream"] = False
                 proxy_request.pop("stream_options", None)
                 openai_response = await run_proxy_tools_loop(
-                    client, proxy_request, headers, intercepted_tool_names,
-                    request_id, fallback_models
+                    client,
+                    proxy_request,
+                    headers,
+                    intercepted_tool_names,
+                    request_id,
+                    fallback_models,
                 )
             else:
                 # Use openrouter_chat_completion which now handles fallback
@@ -2614,15 +3127,18 @@ async def v1_messages(request: Request):
                 actual_output_tokens = usage.get("output_tokens", 0)
                 actual_total = actual_input_tokens + actual_output_tokens
                 if actual_total > 0:
-                    await reconcile_quota(api_key, estimated_total_tokens, actual_total, request_id)
+                    await reconcile_quota(
+                        api_key, estimated_total_tokens, actual_total, request_id
+                    )
 
             # Record successful request
-            request_counter.labels(endpoint='/v1/messages', status='200').inc()
-            request_latency.labels(endpoint='/v1/messages').observe(time.time() - start_time)
+            request_counter.labels(endpoint="/v1/messages", status="200").inc()
+            request_latency.labels(endpoint="/v1/messages").observe(
+                time.time() - start_time
+            )
 
             return JSONResponse(
-                content=anthropic_response,
-                headers={"X-Request-Id": request_id}
+                content=anthropic_response, headers={"X-Request-Id": request_id}
             )
 
         except HTTPException:
@@ -2631,10 +3147,16 @@ async def v1_messages(request: Request):
             raise
         except Exception as e:
             # Catch any other unexpected errors
-            error_counter.labels(endpoint='/v1/messages', error_type='unexpected_error').inc()
-            request_counter.labels(endpoint='/v1/messages', status='500').inc()
-            request_latency.labels(endpoint='/v1/messages').observe(time.time() - start_time)
-            logger.exception(f"Unexpected error in v1_messages: request_id={request_id}")
+            error_counter.labels(
+                endpoint="/v1/messages", error_type="unexpected_error"
+            ).inc()
+            request_counter.labels(endpoint="/v1/messages", status="500").inc()
+            request_latency.labels(endpoint="/v1/messages").observe(
+                time.time() - start_time
+            )
+            logger.exception(
+                f"Unexpected error in v1_messages: request_id={request_id}"
+            )
             raise HTTPException(
                 status_code=500,
                 detail=f"Unexpected error: {str(e)}",
@@ -2658,8 +3180,7 @@ async def v1_messages_count_tokens(request: Request):
         raise HTTPException(status_code=500, detail=f"Failed to count tokens: {str(e)}")
 
     return JSONResponse(
-        content={"input_tokens": input_tokens},
-        headers={"X-Request-Id": request_id}
+        content={"input_tokens": input_tokens}, headers={"X-Request-Id": request_id}
     )
 
 
@@ -2681,9 +3202,11 @@ async def health():
     enabled_features = {
         "auth": bool(PROXY_API_KEYS_SET),
         "metrics": True,  # Always available via /metrics
-        "fallback": bool(FALLBACK_MODELS_SONNET or FALLBACK_MODELS_OPUS or FALLBACK_MODELS_HAIKU),
+        "fallback": bool(
+            FALLBACK_MODELS_SONNET or FALLBACK_MODELS_OPUS or FALLBACK_MODELS_HAIKU
+        ),
         "quotas": bool(QUOTA_CONFIG),
-        "debug_dump": DEBUG_DUMP_REQUESTS
+        "debug_dump": DEBUG_DUMP_REQUESTS,
     }
 
     # Basic config summary (no secrets)
@@ -2694,11 +3217,11 @@ async def health():
             "default": TARGET_MODEL_DEFAULT,
             "small": TARGET_MODEL_SMALL,
             "big": TARGET_MODEL_BIG,
-            "opus": TARGET_MODEL_OPUS
+            "opus": TARGET_MODEL_OPUS,
         },
         "fallback_enabled": enabled_features["fallback"],
         "quota_keys_count": len(QUOTA_CONFIG) if QUOTA_CONFIG else 0,
-        "timeout_seconds": TIMEOUT_S
+        "timeout_seconds": TIMEOUT_S,
     }
 
     return {
@@ -2706,7 +3229,7 @@ async def health():
         "uptime_seconds": uptime_seconds,
         "version": PROXY_VERSION,
         "enabled_features": enabled_features,
-        "config_summary": config_summary
+        "config_summary": config_summary,
     }
 
 
@@ -2721,7 +3244,9 @@ async def admin_stats(request: Request):
     - metrics snapshot (proxy_requests_total for /v1/messages if available)
     - quota enabled keys count
     """
-    request_id = getattr(request.state, "request_id", None) or get_or_generate_request_id(request)
+    request_id = getattr(
+        request.state, "request_id", None
+    ) or get_or_generate_request_id(request)
 
     # Check admin key (after normal X-API-Key auth from middleware)
     check_admin_key(request)
@@ -2733,14 +3258,15 @@ async def admin_stats(request: Request):
     try:
         # Parse prometheus metrics to extract proxy_requests_total for /v1/messages
         from prometheus_client import REGISTRY
+
         for collector in REGISTRY._collector_to_names:
             for metric in collector.collect():
-                if metric.name == 'proxy_requests_total':
+                if metric.name == "proxy_requests_total":
                     for sample in metric.samples:
                         # Filter for /v1/messages endpoint
                         labels = sample.labels or {}
-                        if labels.get('endpoint') == '/v1/messages':
-                            status = labels.get('status', 'unknown')
+                        if labels.get("endpoint") == "/v1/messages":
+                            status = labels.get("status", "unknown")
                             key = f"requests_{status}"
                             metrics_snapshot[key] = sample.value
     except Exception as e:
@@ -2754,9 +3280,9 @@ async def admin_stats(request: Request):
             "uptime_seconds": uptime_seconds,
             "metrics_snapshot": metrics_snapshot,
             "quota_enabled_keys_count": quota_enabled_keys_count,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         },
-        headers={"X-Request-Id": request_id}
+        headers={"X-Request-Id": request_id},
     )
 
 
@@ -2772,7 +3298,9 @@ async def admin_config(request: Request):
     - quota settings (filenames/flags, not actual quotas)
     - debug flags
     """
-    request_id = getattr(request.state, "request_id", None) or get_or_generate_request_id(request)
+    request_id = getattr(
+        request.state, "request_id", None
+    ) or get_or_generate_request_id(request)
 
     # Check admin key (after normal X-API-Key auth from middleware)
     check_admin_key(request)
@@ -2784,36 +3312,39 @@ async def admin_config(request: Request):
             "default": TARGET_MODEL_DEFAULT,
             "small": TARGET_MODEL_SMALL,
             "big": TARGET_MODEL_BIG,
-            "opus": TARGET_MODEL_OPUS
+            "opus": TARGET_MODEL_OPUS,
         },
         "fallback_settings": {
-            "sonnet_models": FALLBACK_MODELS_SONNET.split(",") if FALLBACK_MODELS_SONNET else [],
-            "opus_models": FALLBACK_MODELS_OPUS.split(",") if FALLBACK_MODELS_OPUS else [],
-            "haiku_models": FALLBACK_MODELS_HAIKU.split(",") if FALLBACK_MODELS_HAIKU else [],
+            "sonnet_models": FALLBACK_MODELS_SONNET.split(",")
+            if FALLBACK_MODELS_SONNET
+            else [],
+            "opus_models": FALLBACK_MODELS_OPUS.split(",")
+            if FALLBACK_MODELS_OPUS
+            else [],
+            "haiku_models": FALLBACK_MODELS_HAIKU.split(",")
+            if FALLBACK_MODELS_HAIKU
+            else [],
             "on_status_codes": sorted(list(FALLBACK_ON_STATUS)),
-            "max_tries": FALLBACK_MAX_TRIES
+            "max_tries": FALLBACK_MAX_TRIES,
         },
         "quota_settings": {
             "enabled": bool(QUOTA_CONFIG),
             "config_file": QUOTA_CONFIG_FILE if QUOTA_CONFIG_FILE else None,
             "config_json_set": bool(QUOTA_CONFIG_JSON),
             "state_file": QUOTA_STATE_FILE,
-            "keys_count": len(QUOTA_CONFIG) if QUOTA_CONFIG else 0
+            "keys_count": len(QUOTA_CONFIG) if QUOTA_CONFIG else 0,
         },
         "debug_flags": {
             "debug_dump_requests": DEBUG_DUMP_REQUESTS,
             "proxy_websearch_enabled": PROXY_WEBSEARCH_ENABLED,
-            "openrouter_web_enabled": OPENROUTER_WEB_ENABLED
+            "openrouter_web_enabled": OPENROUTER_WEB_ENABLED,
         },
         "timeout_seconds": TIMEOUT_S,
         "api_keys_count": len(PROXY_API_KEYS_SET),
-        "admin_api_configured": bool(ADMIN_API_KEY)
+        "admin_api_configured": bool(ADMIN_API_KEY),
     }
 
-    return JSONResponse(
-        content=sanitized_config,
-        headers={"X-Request-Id": request_id}
-    )
+    return JSONResponse(content=sanitized_config, headers={"X-Request-Id": request_id})
 
 
 @app.get("/metrics")
@@ -2823,7 +3354,9 @@ async def metrics(request: Request):
 
     This endpoint requires X-API-Key authentication for security.
     """
-    request_id = getattr(request.state, "request_id", None) or get_or_generate_request_id(request)
+    request_id = getattr(
+        request.state, "request_id", None
+    ) or get_or_generate_request_id(request)
     return Response(
         content=generate_latest(),
         media_type=CONTENT_TYPE_LATEST,
@@ -2850,8 +3383,13 @@ async def v1_models(request: Request = None):
 
     # Check if cache is valid
     current_time = time.time()
-    if MODELS_CACHE is not None and (current_time - MODELS_CACHE_TIMESTAMP) < MODELS_CACHE_TTL:
-        logger.debug(f"Returning cached models (age: {current_time - MODELS_CACHE_TIMESTAMP:.1f}s)")
+    if (
+        MODELS_CACHE is not None
+        and (current_time - MODELS_CACHE_TIMESTAMP) < MODELS_CACHE_TTL
+    ):
+        logger.debug(
+            f"Returning cached models (age: {current_time - MODELS_CACHE_TIMESTAMP:.1f}s)"
+        )
         return JSONResponse(content=MODELS_CACHE, headers={"X-Request-Id": request_id})
 
     # Cache miss or expired - fetch from OpenRouter
@@ -2860,7 +3398,7 @@ async def v1_models(request: Request = None):
             # Fetch available models from OpenRouter
             response = await client.get(
                 f"{OPENROUTER_BASE_URL}/models",
-                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"}
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
             )
 
             if response.status_code == 200:
@@ -2871,54 +3409,94 @@ async def v1_models(request: Request = None):
                 anthropic_models = []
                 for model in models:
                     model_id = model.get("id", "")
-                    anthropic_models.append({
-                        "type": "model",
-                        "id": model_id,
-                        "display_name": model.get("name", model_id),
-                        "created_at": model.get("created", "2024-01-01T00:00:00Z")
-                    })
+                    anthropic_models.append(
+                        {
+                            "type": "model",
+                            "id": model_id,
+                            "display_name": model.get("name", model_id),
+                            "created_at": model.get("created", "2024-01-01T00:00:00Z"),
+                        }
+                    )
 
-                result = {"data": anthropic_models, "has_more": False, "first_id": None, "last_id": None}
+                result = {
+                    "data": anthropic_models,
+                    "has_more": False,
+                    "first_id": None,
+                    "last_id": None,
+                }
 
                 # Update cache
                 MODELS_CACHE = result
                 MODELS_CACHE_TIMESTAMP = current_time
                 logger.info(f"Cached {len(anthropic_models)} models from OpenRouter")
 
-                return JSONResponse(content=result, headers={"X-Request-Id": request_id})
+                return JSONResponse(
+                    content=result, headers={"X-Request-Id": request_id}
+                )
             else:
                 # Fallback to basic model list if OpenRouter API fails
-                logger.warning(f"Failed to fetch models from OpenRouter: {response.status_code}")
+                logger.warning(
+                    f"Failed to fetch models from OpenRouter: {response.status_code}"
+                )
                 fallback_result = {
                     "data": [
-                        {"type": "model", "id": TARGET_MODEL_DEFAULT, "display_name": "Default", "created_at": "2024-01-01T00:00:00Z"},
-                        {"type": "model", "id": TARGET_MODEL_SMALL, "display_name": "Small (Haiku)", "created_at": "2024-01-01T00:00:00Z"},
-                        {"type": "model", "id": TARGET_MODEL_BIG, "display_name": "Big (Sonnet)", "created_at": "2024-01-01T00:00:00Z"},
-                        {"type": "model", "id": TARGET_MODEL_OPUS, "display_name": "Opus", "created_at": "2024-01-01T00:00:00Z"}
+                        {
+                            "type": "model",
+                            "id": TARGET_MODEL_DEFAULT,
+                            "display_name": "Default",
+                            "created_at": "2024-01-01T00:00:00Z",
+                        },
+                        {
+                            "type": "model",
+                            "id": TARGET_MODEL_SMALL,
+                            "display_name": "Small (Haiku)",
+                            "created_at": "2024-01-01T00:00:00Z",
+                        },
+                        {
+                            "type": "model",
+                            "id": TARGET_MODEL_BIG,
+                            "display_name": "Big (Sonnet)",
+                            "created_at": "2024-01-01T00:00:00Z",
+                        },
+                        {
+                            "type": "model",
+                            "id": TARGET_MODEL_OPUS,
+                            "display_name": "Opus",
+                            "created_at": "2024-01-01T00:00:00Z",
+                        },
                     ],
                     "has_more": False,
                     "first_id": None,
-                    "last_id": None
+                    "last_id": None,
                 }
                 # Cache fallback result too
                 MODELS_CACHE = fallback_result
                 MODELS_CACHE_TIMESTAMP = current_time
-                return JSONResponse(content=fallback_result, headers={"X-Request-Id": request_id})
+                return JSONResponse(
+                    content=fallback_result, headers={"X-Request-Id": request_id}
+                )
         except Exception as e:
             logger.error(f"Error fetching models: {e}")
             # Return minimal model list on error
             error_result = {
                 "data": [
-                    {"type": "model", "id": TARGET_MODEL_DEFAULT, "display_name": "Default", "created_at": "2024-01-01T00:00:00Z"}
+                    {
+                        "type": "model",
+                        "id": TARGET_MODEL_DEFAULT,
+                        "display_name": "Default",
+                        "created_at": "2024-01-01T00:00:00Z",
+                    }
                 ],
                 "has_more": False,
                 "first_id": None,
-                "last_id": None
+                "last_id": None,
             }
             # Cache error result too (with shorter TTL)
             MODELS_CACHE = error_result
             MODELS_CACHE_TIMESTAMP = current_time
-            return JSONResponse(content=error_result, headers={"X-Request-Id": request_id})
+            return JSONResponse(
+                content=error_result, headers={"X-Request-Id": request_id}
+            )
 
 
 @app.get("/v1/models/{model_id:path}")
@@ -2946,8 +3524,21 @@ async def v1_model_by_id(model_id: str, request: Request = None):
 
     # Accept any model that looks valid
     is_valid = (
-        "/" in base_model or  # OpenRouter format
-        any(kw in clean_model_id.lower() for kw in ["opus", "sonnet", "haiku", "claude", "gpt", "deepseek", "gemini", "mistral", "llama"])
+        "/" in base_model  # OpenRouter format
+        or any(
+            kw in clean_model_id.lower()
+            for kw in [
+                "opus",
+                "sonnet",
+                "haiku",
+                "claude",
+                "gpt",
+                "deepseek",
+                "gemini",
+                "mistral",
+                "llama",
+            ]
+        )
     )
 
     if is_valid:
@@ -2956,9 +3547,9 @@ async def v1_model_by_id(model_id: str, request: Request = None):
                 "type": "model",
                 "id": model_id,
                 "display_name": model_id,
-                "created_at": "2024-01-01T00:00:00Z"
+                "created_at": "2024-01-01T00:00:00Z",
             },
-            headers={"X-Request-Id": request_id}
+            headers={"X-Request-Id": request_id},
         )
 
     raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
@@ -2977,11 +3568,8 @@ async def v1_usage(request: Request):
 
     if not QUOTA_CONFIG:
         return JSONResponse(
-            content={
-                "quota_enabled": False,
-                "message": "Quota system not configured"
-            },
-            headers={"X-Request-Id": request_id}
+            content={"quota_enabled": False, "message": "Quota system not configured"},
+            headers={"X-Request-Id": request_id},
         )
 
     # Build usage report
@@ -2989,10 +3577,9 @@ async def v1_usage(request: Request):
 
     async with quota_state_lock:
         for key, limit in QUOTA_CONFIG.items():
-            state = quota_state.get(key, {
-                "used_tokens": 0,
-                "reset_at": get_next_utc_midnight()
-            })
+            state = quota_state.get(
+                key, {"used_tokens": 0, "reset_at": get_next_utc_midnight()}
+            )
 
             # Check if reset is needed
             reset_at = datetime.fromisoformat(state["reset_at"])
@@ -3004,21 +3591,23 @@ async def v1_usage(request: Request):
                 used_tokens = state["used_tokens"]
                 reset_at_str = state["reset_at"]
 
-            usage_report.append({
-                "api_key": mask_api_key(key),
-                "used_tokens": used_tokens,
-                "quota_limit": limit,
-                "remaining_tokens": max(0, limit - used_tokens),
-                "reset_at": reset_at_str
-            })
+            usage_report.append(
+                {
+                    "api_key": mask_api_key(key),
+                    "used_tokens": used_tokens,
+                    "quota_limit": limit,
+                    "remaining_tokens": max(0, limit - used_tokens),
+                    "reset_at": reset_at_str,
+                }
+            )
 
     return JSONResponse(
         content={
             "quota_enabled": True,
             "keys": usage_report,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         },
-        headers={"X-Request-Id": request_id}
+        headers={"X-Request-Id": request_id},
     )
 
 
@@ -3040,10 +3629,10 @@ async def root(request: Request = None):
                 "/v1/admin/stats": "Admin stats (GET, requires X-API-Key + X-Admin-Key)",
                 "/v1/admin/config": "Admin config (GET, requires X-API-Key + X-Admin-Key)",
                 "/health": "Enhanced health check (GET, public)",
-                "/metrics": "Prometheus metrics (GET, requires auth)"
-            }
+                "/metrics": "Prometheus metrics (GET, requires auth)",
+            },
         },
-        headers={"X-Request-Id": request_id}
+        headers={"X-Request-Id": request_id},
     )
 
 
@@ -3069,7 +3658,9 @@ async def event_logging_batch(request: Request):
     timestamp = body.get("timestamp", "")
 
     # Log events
-    logger.info(f"Event batch received [batch_id={batch_id}, events_count={len(events)}]")
+    logger.info(
+        f"Event batch received [batch_id={batch_id}, events_count={len(events)}]"
+    )
 
     for idx, event in enumerate(events):
         event_type = event.get("event_type", "unknown")
@@ -3084,9 +3675,9 @@ async def event_logging_batch(request: Request):
             "received": len(events),
             "processed": len(events),
             "errors": [],
-            "timestamp": timestamp if timestamp else str(uuid.uuid4())
+            "timestamp": timestamp if timestamp else str(uuid.uuid4()),
         },
-        headers={"X-Request-Id": request_id}
+        headers={"X-Request-Id": request_id},
     )
 
 

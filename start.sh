@@ -4,10 +4,18 @@
 pkill -f "python3 proxy.py" 2>/dev/null
 sleep 1
 
+# Load env vars from .env if present (for local dev)
+if [ -f ".env" ]; then
+    set -a
+    source .env
+    set +a
+fi
+
 # Check if OPENROUTER_API_KEY is set
 if [ -z "$OPENROUTER_API_KEY" ]; then
     echo "Error: OPENROUTER_API_KEY environment variable is not set"
     echo "Please set it with: export OPENROUTER_API_KEY=your-key"
+    echo "Or create a .env file with OPENROUTER_API_KEY=..."
     exit 1
 fi
 
