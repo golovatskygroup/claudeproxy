@@ -349,7 +349,115 @@ async def main() -> int:
         )
         assert r.status_code == 200, r.text[:400]
 
-    await step("10/10 model slug pass-through request succeeds", _model_passthrough)
+    await step("10/12 model slug pass-through request succeeds", _model_passthrough)
+
+    # 11) tool_call ID normalization (non-streaming)
+    async def _tool_call_id_normalization():
+        """Test that tool_use IDs are normalized to Anthropic-compatible format."""
+        import re
+        anthropic_pattern = re.compile(r'^[a-zA-Z0-9_-]+$')
+
+        r = await post_json(
+            "/v1/messages",
+            {
+                "model": TEST_MODEL,
+                "max_tokens": 256,
+                "stream": False,
+                "messages": [{"role": "user", "content": "What is 2 + 2? Use the calculator tool."}],
+                "tools": [
+                    {
+                        "name": "calculator",
+                        "description": "A simple calculator that can add two numbers",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "a": {"type": "number", "description": "First number"},
+                                "b": {"type": "number", "description": "Second number"},
+                            },
+                            "required": ["a", "b"],
+                        },
+                    }
+                ],
+            },
+            timeout_s=90.0,
+        )
+        assert r.status_code == 200, f"tool_call request failed: {r.text[:400]}"
+        data = r.json()
+
+        # Find tool_use blocks
+        content = data.get("content", [])
+        tool_uses = [c for c in content if c.get("type") == "tool_use"]
+
+        if tool_uses:
+            for tu in tool_uses:
+                tool_id = tu.get("id", "")
+                assert tool_id, f"tool_use block has no id: {tu}"
+                assert anthropic_pattern.match(tool_id), (
+                    f"tool_use.id '{tool_id}' does not match Anthropic pattern ^[a-zA-Z0-9_-]+$. "
+                    f"This may cause errors when the client sends tool_result back."
+                )
+                print(f"  tool_use.id = {tool_id!r} ✓", flush=True)
+        else:
+            # Model didn't use the tool - that's OK for this test, we just want to verify
+            # IF tools are called, the IDs are normalized
+            print("  (model did not call tools - normalization not tested)", flush=True)
+
+    await step("11/12 tool_call IDs are Anthropic-compatible (non-streaming)", _tool_call_id_normalization)
+
+    # 12) tool_call ID normalization (streaming)
+    async def _tool_call_id_normalization_streaming():
+        """Test that tool_use IDs are normalized in streaming mode."""
+        import re
+        anthropic_pattern = re.compile(r'^[a-zA-Z0-9_-]+$')
+
+        payload = {
+            "model": TEST_MODEL,
+            "max_tokens": 256,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Calculate 5 + 3 using the calculator tool."}],
+            "tools": [
+                {
+                    "name": "calculator",
+                    "description": "A calculator that adds two numbers",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "a": {"type": "number"},
+                            "b": {"type": "number"},
+                        },
+                        "required": ["a", "b"],
+                    },
+                }
+            ],
+        }
+
+        timeout = httpx.Timeout(STREAM_TIMEOUT_S, connect=10.0, read=READ_IDLE_TIMEOUT_S, write=10.0, pool=10.0)
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", _url("/v1/messages"), headers=_headers(), json=payload) as resp:
+                assert resp.status_code == 200, f"streaming tool_call failed: status={resp.status_code}"
+
+                tool_ids_found = []
+                async for ev in iter_sse_events(resp):
+                    if ev.event == "content_block_start":
+                        cb = ev.data.get("content_block", {}) if isinstance(ev.data, dict) else {}
+                        if cb.get("type") == "tool_use":
+                            tool_id = cb.get("id", "")
+                            if tool_id:
+                                tool_ids_found.append(tool_id)
+                    if ev.event == "message_stop":
+                        break
+
+                if tool_ids_found:
+                    for tool_id in tool_ids_found:
+                        assert anthropic_pattern.match(tool_id), (
+                            f"streaming tool_use.id '{tool_id}' does not match Anthropic pattern"
+                        )
+                        print(f"  streaming tool_use.id = {tool_id!r} ✓", flush=True)
+                else:
+                    print("  (model did not call tools in streaming - normalization not tested)", flush=True)
+
+    await step("12/12 tool_call IDs are Anthropic-compatible (streaming)", _tool_call_id_normalization_streaming)
 
     print("ALL TESTS PASSED", flush=True)
     return 0

@@ -11,6 +11,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 # Track proxy startup time for uptime calculation
 PROXY_START_TIME = time.time()
-PROXY_VERSION = "1.0.0"
+PROXY_VERSION = "1.0.2-gemini-fix"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration from environment variables
@@ -170,6 +171,7 @@ def _gemini_cache_cleanup(now: Optional[float] = None) -> None:
 def gemini_tool_meta_put(tool_call_id: str, meta: dict[str, Any]) -> None:
     if not tool_call_id or not isinstance(meta, dict) or not meta:
         return
+    logger.debug(f"[GEMINI_META] PUT id={tool_call_id!r} meta={meta}")
     _gemini_cache_cleanup()
     entry = _gemini_tool_meta_cache.get(tool_call_id) or {}
     # Do not store internal keys from callers.
@@ -1333,6 +1335,33 @@ def normalize_tool_call_ids_for_kimi(messages: list) -> list:
     return normalized_messages
 
 
+def normalize_tool_id_for_anthropic(tool_id: str) -> str:
+    """
+    Normalize tool_call_id to Anthropic-compatible format.
+
+    Some models (Kimi K2, Gemini, etc.) generate tool call IDs containing characters
+    that are not allowed in Anthropic's tool_use.id pattern: `^[a-zA-Z0-9_-]+`
+
+    Examples of problematic formats:
+    - Kimi K2: `functions.func_name:idx` (contains `.` and `:`)
+    - Other models may use various special characters
+
+    This function sanitizes IDs by replacing disallowed characters with `_`.
+
+    Examples:
+        functions.get_weather:0 -> functions_get_weather_0
+        functions.Bash:1 -> functions_Bash_1
+        toolu_abc123 -> toolu_abc123 (unchanged, already valid)
+    """
+    if not tool_id:
+        return tool_id
+
+    # Replace characters not allowed in Anthropic pattern ^[a-zA-Z0-9_-]+
+    # Keep only alphanumeric, underscore, and hyphen
+    normalized = re.sub(r'[^a-zA-Z0-9_-]', '_', tool_id)
+    return normalized
+
+
 def anthropic_messages_to_openai_messages(
     messages: list, system: Optional[str] = None
 ) -> list:
@@ -1434,23 +1463,29 @@ def anthropic_messages_to_openai_messages(
                                 },
                             }
 
-                            # Re-inject Gemini/OpenRouter continuity metadata if we have it.
-                            # This is needed for some Gemini reasoning models when tools are used.
-                            try:
-                                meta = gemini_tool_meta_get(tc_id)
-                                sig = meta.get("thought_signature")
-                                if sig is not None:
-                                    tc["thought_signature"] = sig
-                                    if isinstance(tc.get("function"), dict):
-                                        tc["function"]["thought_signature"] = sig
+                            # Re-inject Gemini thought_signature for function calls.
+                            # Gemini 3+ requires this for multi-turn tool calling.
+                            # If no cached signature exists (cross-model session),
+                            # use official Google bypass value.
+                            meta = gemini_tool_meta_get(tc_id)
+                            sig = meta.get("thought_signature") or meta.get("thoughtSignature")
+                            if sig is None:
+                                # Official bypass value from Google Gemini 3 docs
+                                sig = "context_engineering_is_the_way_to_go"
+                            # Add in both formats for compatibility
+                            tc["thought_signature"] = sig
+                            tc["thoughtSignature"] = sig
+                            if isinstance(tc.get("function"), dict):
+                                tc["function"]["thought_signature"] = sig
+                                tc["function"]["thoughtSignature"] = sig
 
-                                rd = meta.get("reasoning_details")
-                                if rd is not None:
-                                    tc["reasoning_details"] = rd
-                                    if isinstance(tc.get("function"), dict):
-                                        tc["function"]["reasoning_details"] = rd
-                            except Exception:
-                                pass
+                            rd = meta.get("reasoning_details") or meta.get("reasoningDetails")
+                            if rd is not None:
+                                tc["reasoning_details"] = rd
+                                tc["reasoningDetails"] = rd
+                                if isinstance(tc.get("function"), dict):
+                                    tc["function"]["reasoning_details"] = rd
+                                    tc["function"]["reasoningDetails"] = rd
 
                             tool_calls.append(tc)
                     elif isinstance(block, str):
@@ -1465,12 +1500,69 @@ def anthropic_messages_to_openai_messages(
 
                 if tool_calls:
                     assistant_msg["tool_calls"] = tool_calls
+                    # Debug: log tool_calls with thought_signature status
+                    for i, tc in enumerate(tool_calls):
+                        tc_id = tc.get("id", "")[:16]
+                        tc_name = tc.get("function", {}).get("name", "")
+                        tc_sig = tc.get("thought_signature", "MISSING")[:30] if tc.get("thought_signature") else "MISSING"
+                        logger.debug(f"[TOOL_CALL] idx={i} id={tc_id}... name={tc_name} sig={tc_sig}...")
+
+                    # Re-inject reasoning_details at message level for Gemini 3 / OpenRouter.
+                    # Try to get from the first tool call's cached meta.
+                    first_tc_id = tool_calls[0].get("id", "") if tool_calls else ""
+                    if first_tc_id:
+                        meta = gemini_tool_meta_get(first_tc_id)
+                        rd = meta.get("reasoning_details") or meta.get("reasoningDetails")
+                        if rd is not None:
+                            assistant_msg["reasoning_details"] = rd
 
                 openai_messages.append(assistant_msg)
             else:
                 openai_messages.append({"role": "assistant", "content": content})
 
     return openai_messages
+
+
+def _normalize_domain_list(val: Any) -> Optional[list[str]]:
+    """Normalize a domain list: accept only list[str], strip whitespace, drop empties."""
+    if not isinstance(val, list):
+        return None
+    out = [d.strip() for d in val if isinstance(d, str) and d.strip()]
+    return out or None
+
+
+def _normalize_websearch_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """
+    Normalize WebSearch tool arguments to prevent API errors.
+
+    Claude Code's WebSearch tool rejects requests that specify both allowed_domains
+    and blocked_domains (even if they are empty arrays). This function:
+    - Removes empty/invalid domain lists
+    - If both are present and non-empty, keeps only allowed_domains (prefer allowlist)
+    """
+    if tool_name != "WebSearch":
+        return args
+
+    args = dict(args)  # Don't mutate original
+    allowed = _normalize_domain_list(args.get("allowed_domains"))
+    blocked = _normalize_domain_list(args.get("blocked_domains"))
+
+    # Remove original keys first
+    args.pop("allowed_domains", None)
+    args.pop("blocked_domains", None)
+
+    # If both present and non-empty, prefer allowlist
+    if allowed and blocked:
+        logger.debug("WebSearch: both allowed/blocked domains present; keeping only allowed_domains")
+        blocked = None
+
+    # Re-add only if non-empty
+    if allowed:
+        args["allowed_domains"] = allowed
+    if blocked:
+        args["blocked_domains"] = blocked
+
+    return args
 
 
 def _domain_matches(host: str, domain: str) -> bool:
@@ -1503,17 +1595,16 @@ async def exa_search_and_contents(
     max_results = max(1, EXA_MAX_RESULTS)
     payload: dict[str, Any] = {
         "query": query,
-        "num_results": max_results,
-        "use_autoprompt": EXA_USE_AUTOPROMPT,
+        "numResults": max_results,
         "type": EXA_SEARCH_TYPE,
         "text": True,
     }
     if allowed_domains:
-        payload["include_domains"] = allowed_domains
+        payload["includeDomains"] = allowed_domains
     if blocked_domains_for_payload:
-        payload["exclude_domains"] = blocked_domains_for_payload
+        payload["excludeDomains"] = blocked_domains_for_payload
 
-    url = f"{EXA_BASE_URL.rstrip('/')}/search_and_contents"
+    url = f"{EXA_BASE_URL.rstrip('/')}/search"
     headers = {
         "Authorization": f"Bearer {EXA_API_KEY}",
         "Content-Type": "application/json",
@@ -1614,14 +1705,11 @@ def openai_response_to_anthropic_message(response: dict, model: str) -> dict:
     message = choice.get("message", {})
     usage = response.get("usage", {})
 
-    # Defense-in-depth: Remove reasoning fields from message (never expose to client)
-    # These fields may be present even when we request exclusion upstream
-    message.pop("reasoning", None)
-    message.pop("reasoning_content", None)
-    message.pop("reasoning_details", None)
-
     # Cache Gemini/OpenRouter continuity metadata from tool calls so that when the client
     # later sends tool_result blocks, we can re-inject the required metadata.
+    #
+    # IMPORTANT: Capture before stripping reasoning_* fields from the message. Some Gemini
+    # providers require reasoning_details to be echoed back in later requests.
     try:
         for tc in (message.get("tool_calls") or []):
             if not isinstance(tc, dict):
@@ -1632,6 +1720,12 @@ def openai_response_to_anthropic_message(response: dict, model: str) -> dict:
                 gemini_tool_meta_put(tc_id, meta)
     except Exception:
         pass
+
+    # Defense-in-depth: Remove reasoning fields from message (never expose to client)
+    # These fields may be present even when we request exclusion upstream
+    message.pop("reasoning", None)
+    message.pop("reasoning_content", None)
+    message.pop("reasoning_details", None)
 
     # Log cache effectiveness if cache metrics are present
     prompt_tokens_details = usage.get("prompt_tokens_details", {})
@@ -1655,16 +1749,25 @@ def openai_response_to_anthropic_message(response: dict, model: str) -> dict:
     tool_calls = message.get("tool_calls", [])
     for tc in tool_calls:
         func = tc.get("function", {})
+        tool_name = func.get("name", "")
         try:
             args = json.loads(func.get("arguments", "{}"))
         except json.JSONDecodeError:
             args = {}
 
+        # Normalize WebSearch arguments to avoid "both domains" error
+        args = _normalize_websearch_args(tool_name, args)
+
+        # Normalize tool_call_id for Anthropic compatibility
+        # Some models (Kimi, Gemini, etc.) generate IDs with disallowed characters
+        raw_id = tc.get("id") or str(uuid.uuid4())
+        normalized_id = normalize_tool_id_for_anthropic(raw_id)
+
         content.append(
             {
                 "type": "tool_use",
-                "id": tc.get("id", str(uuid.uuid4())),
-                "name": func.get("name", ""),
+                "id": normalized_id,
+                "name": tool_name,
                 "input": args,
             }
         )
@@ -1921,6 +2024,21 @@ async def stream_openrouter_to_anthropic(
                         )
                         continue
 
+                    # Cache Gemini/OpenRouter continuity metadata from tool calls (e.g.
+                    # thought_signature / reasoning_details) before stripping.
+                    # Some Gemini providers require these fields to be echoed back.
+                    try:
+                        delta_tc = (chunk.get("choices") or [{}])[0].get("delta") or {}
+                        for tc in (delta_tc.get("tool_calls") or []):
+                            if not isinstance(tc, dict):
+                                continue
+                            tc_id = tc.get("id") or ""
+                            meta = extract_gemini_tool_meta(tc, delta_tc)
+                            if tc_id and meta:
+                                gemini_tool_meta_put(tc_id, meta)
+                    except Exception:
+                        pass
+
                     # Defense-in-depth: Strip reasoning fields from chunk itself (some providers attach outside delta)
                     chunk.pop("reasoning", None)
                     chunk.pop("reasoning_content", None)
@@ -1974,6 +2092,20 @@ async def stream_openrouter_to_anthropic(
                     choice = choices[0]
                     delta = choice.get("delta", {})
                     finish_reason = choice.get("finish_reason")
+
+                    # Cache Gemini/OpenRouter continuity metadata from tool calls before stripping.
+                    # Some Gemini providers require these fields (thought_signature / reasoning_details)
+                    # to be preserved across tool turns.
+                    try:
+                        for tc in (delta.get("tool_calls") or []):
+                            if not isinstance(tc, dict):
+                                continue
+                            tc_id = tc.get("id") or ""
+                            meta = extract_gemini_tool_meta(tc, delta)
+                            if tc_id and meta:
+                                gemini_tool_meta_put(tc_id, meta)
+                    except Exception:
+                        pass
 
                     # Defense-in-depth: Strip reasoning fields from delta (never expose to client)
                     delta.pop("reasoning", None)
@@ -2065,20 +2197,29 @@ async def stream_openrouter_to_anthropic(
 
                             if tc_index not in current_tool_calls:
                                 # New tool call - create it
-                                tool_id = tc_delta.get(
+                                raw_tool_id = tc_delta.get(
                                     "id", f"toolu_{uuid.uuid4().hex[:24]}"
                                 )
+                                # Normalize tool_call_id for Anthropic compatibility
+                                # Some models generate IDs with disallowed characters
+                                tool_id = normalize_tool_id_for_anthropic(raw_tool_id)
                                 func = tc_delta.get("function", {})
                                 tool_name = func.get("name", "")
 
                                 # Calculate content block index (after text blocks)
                                 block_index = len(content_blocks)
 
+                                # WebSearch needs buffered streaming to normalize arguments
+                                # (Claude Code rejects requests with both allowed/blocked_domains)
+                                needs_buffering = tool_name == "WebSearch"
+
                                 current_tool_calls[tc_index] = {
                                     "block_index": block_index,
                                     "id": tool_id,
                                     "name": tool_name,
                                     "arguments": "",
+                                    "buffered": needs_buffering,
+                                    "started": False,
                                 }
 
                                 content_blocks.append(
@@ -2090,22 +2231,25 @@ async def stream_openrouter_to_anthropic(
                                     }
                                 )
 
-                                yield (
-                                    sse_event(
-                                        "content_block_start",
-                                        {
-                                            "type": "content_block_start",
-                                            "index": block_index,
-                                            "content_block": {
-                                                "type": "tool_use",
-                                                "id": tool_id,
-                                                "name": tool_name,
-                                                "input": {},
+                                # For non-buffered tools, emit content_block_start immediately
+                                if not needs_buffering:
+                                    yield (
+                                        sse_event(
+                                            "content_block_start",
+                                            {
+                                                "type": "content_block_start",
+                                                "index": block_index,
+                                                "content_block": {
+                                                    "type": "tool_use",
+                                                    "id": tool_id,
+                                                    "name": tool_name,
+                                                    "input": {},
+                                                },
                                             },
-                                        },
-                                    ),
-                                    None,
-                                )
+                                        ),
+                                        None,
+                                    )
+                                    current_tool_calls[tc_index]["started"] = True
 
                             # Handle argument delta
                             func = tc_delta.get("function", {})
@@ -2115,26 +2259,78 @@ async def stream_openrouter_to_anthropic(
                                     tc_info = current_tool_calls[tc_index]
                                     tc_info["arguments"] += arg_delta
 
-                                    yield (
-                                        sse_event(
-                                            "content_block_delta",
-                                            {
-                                                "type": "content_block_delta",
-                                                "index": tc_info["block_index"],
-                                                "delta": {
-                                                    "type": "input_json_delta",
-                                                    "partial_json": arg_delta,
+                                    # For non-buffered tools, stream deltas immediately
+                                    if not tc_info.get("buffered"):
+                                        yield (
+                                            sse_event(
+                                                "content_block_delta",
+                                                {
+                                                    "type": "content_block_delta",
+                                                    "index": tc_info["block_index"],
+                                                    "delta": {
+                                                        "type": "input_json_delta",
+                                                        "partial_json": arg_delta,
+                                                    },
                                                 },
-                                            },
-                                        ),
-                                        None,
-                                    )
+                                            ),
+                                            None,
+                                        )
 
                     # Handle finish reason
                     if finish_reason:
                         stop_reason = finish_reason_to_anthropic_stop_reason(
                             finish_reason
                         )
+
+                # Emit buffered tool calls (e.g., WebSearch) with normalized arguments
+                for tc_index, tc_info in current_tool_calls.items():
+                    if tc_info.get("buffered") and not tc_info.get("started"):
+                        # Parse and normalize arguments
+                        try:
+                            args = json.loads(tc_info["arguments"]) if tc_info["arguments"] else {}
+                        except json.JSONDecodeError:
+                            args = {}
+                        args = _normalize_websearch_args(tc_info["name"], args)
+
+                        # Update content_blocks with normalized input
+                        content_blocks[tc_info["block_index"]]["input"] = args
+
+                        # Emit content_block_start with full normalized input
+                        yield (
+                            sse_event(
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": tc_info["block_index"],
+                                    "content_block": {
+                                        "type": "tool_use",
+                                        "id": tc_info["id"],
+                                        "name": tc_info["name"],
+                                        "input": args,
+                                    },
+                                },
+                            ),
+                            None,
+                        )
+
+                        # Emit the full JSON as a single delta (for clients that expect deltas)
+                        if args:
+                            yield (
+                                sse_event(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": tc_info["block_index"],
+                                        "delta": {
+                                            "type": "input_json_delta",
+                                            "partial_json": json.dumps(args),
+                                        },
+                                    },
+                                ),
+                                None,
+                            )
+
+                        tc_info["started"] = True
 
                 # Close all content blocks
                 for i in range(len(content_blocks)):

@@ -11,8 +11,11 @@ from proxy import (
     anthropic_messages_to_openai_messages,
     inject_cache_control_for_anthropic,
     normalize_tool_call_ids_for_kimi,
+    normalize_tool_id_for_anthropic,
     openai_response_to_anthropic_message,
     anthropic_sse_from_message,
+    gemini_tool_meta_put,
+    gemini_tool_meta_get,
 )
 
 
@@ -93,6 +96,84 @@ def test_kimi_tool_call_normalization():
     assert result[1]["tool_call_id"] == "functions.get_weather:0"
     assert result[2]["tool_call_id"] == "functions.get_weather:1"
     print("✓ kimi_tool_call_normalization passed")
+
+
+def test_normalize_tool_id_for_anthropic():
+    """Test tool_id normalization for Anthropic compatibility."""
+    # Test Kimi-style IDs (functions.name:index)
+    assert normalize_tool_id_for_anthropic("functions.get_weather:0") == "functions_get_weather_0"
+    assert normalize_tool_id_for_anthropic("functions.Bash:1") == "functions_Bash_1"
+    assert normalize_tool_id_for_anthropic("functions.Read:123") == "functions_Read_123"
+
+    # Test valid Anthropic IDs (should remain unchanged)
+    assert normalize_tool_id_for_anthropic("toolu_abc123") == "toolu_abc123"
+    assert normalize_tool_id_for_anthropic("toolu_01HXJ8V3YZ") == "toolu_01HXJ8V3YZ"
+    assert normalize_tool_id_for_anthropic("call_abc-123_xyz") == "call_abc-123_xyz"
+
+    # Test edge cases
+    assert normalize_tool_id_for_anthropic("") == ""
+    assert normalize_tool_id_for_anthropic(None) is None
+
+    # Test IDs with various special characters
+    assert normalize_tool_id_for_anthropic("tool@call#123") == "tool_call_123"
+    assert normalize_tool_id_for_anthropic("func(name)") == "func_name_"
+    assert normalize_tool_id_for_anthropic("a.b:c/d\\e") == "a_b_c_d_e"
+
+    print("✓ normalize_tool_id_for_anthropic passed")
+
+
+def test_openai_response_tool_id_normalization():
+    """Test that openai_response_to_anthropic_message normalizes tool IDs."""
+    # Simulate OpenAI response with Kimi-style tool call IDs
+    openai_response = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "functions.get_weather:0",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"location": "Tokyo"}'
+                            }
+                        },
+                        {
+                            "id": "functions.Bash:1",
+                            "type": "function",
+                            "function": {
+                                "name": "Bash",
+                                "arguments": '{"command": "ls"}'
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }
+        ],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+    }
+
+    result = openai_response_to_anthropic_message(openai_response, "test-model")
+
+    # Check that tool_use IDs are normalized
+    tool_uses = [c for c in result["content"] if c["type"] == "tool_use"]
+    assert len(tool_uses) == 2
+    assert tool_uses[0]["id"] == "functions_get_weather_0"
+    assert tool_uses[1]["id"] == "functions_Bash_1"
+
+    # Verify the IDs match Anthropic's pattern ^[a-zA-Z0-9_-]+
+    import re
+    anthropic_pattern = re.compile(r'^[a-zA-Z0-9_-]+$')
+    for tool_use in tool_uses:
+        assert anthropic_pattern.match(tool_use["id"]), f"ID {tool_use['id']} doesn't match Anthropic pattern"
+
+    print("✓ openai_response_tool_id_normalization passed")
 
 
 def test_cache_control_injection():
@@ -280,6 +361,193 @@ def test_reasoning_filtering_non_streaming():
     print("✓ reasoning_filtering_non_streaming passed")
 
 
+def test_gemini_reasoning_details_preserved_in_cache_before_stripping():
+    """Test that reasoning_details can be cached for later reinjection even if stripped from output."""
+    from proxy import gemini_tool_meta_get
+
+    openrouter_response = {
+        "id": "chatcmpl-test456",
+        "object": "chat.completion",
+        "created": 1234567890,
+        "model": "google/gemini-2.0-flash",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Calling tool...",
+                    "tool_calls": [
+                        {
+                            "id": "toolu_test_1",
+                            "type": "function",
+                            "function": {
+                                "name": "WebSearch",
+                                "arguments": "{}",
+                            },
+                            "reasoning_details": {"provider": "google", "v": 1},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }
+
+    _ = openai_response_to_anthropic_message(openrouter_response, "google/gemini-2.0-flash")
+
+    meta = gemini_tool_meta_get("toolu_test_1")
+    assert meta.get("reasoning_details") == {"provider": "google", "v": 1}
+    print("✓ gemini_reasoning_details_cached passed")
+
+
+def test_websearch_args_normalization():
+    """Test that WebSearch tool call arguments are normalized to avoid 'both domains' error."""
+    from proxy import _normalize_domain_list, _normalize_websearch_args
+
+    # Test _normalize_domain_list
+    assert _normalize_domain_list(None) is None
+    assert _normalize_domain_list("not-a-list") is None
+    assert _normalize_domain_list([]) is None
+    assert _normalize_domain_list([""]) is None
+    assert _normalize_domain_list(["  ", "\t"]) is None
+    assert _normalize_domain_list(["example.com"]) == ["example.com"]
+    assert _normalize_domain_list(["  example.com  ", "test.org"]) == ["example.com", "test.org"]
+    assert _normalize_domain_list(["", "valid.com", "  "]) == ["valid.com"]
+
+    # Test _normalize_websearch_args - non-WebSearch tools are unchanged
+    other_args = {"query": "test", "allowed_domains": [], "blocked_domains": []}
+    result = _normalize_websearch_args("OtherTool", other_args)
+    assert result == other_args
+
+    # Test _normalize_websearch_args - empty arrays are removed
+    ws_args = {"query": "test", "allowed_domains": [], "blocked_domains": []}
+    result = _normalize_websearch_args("WebSearch", ws_args)
+    assert "allowed_domains" not in result
+    assert "blocked_domains" not in result
+    assert result["query"] == "test"
+
+    # Test _normalize_websearch_args - only allowed_domains kept if both present
+    ws_args = {"query": "test", "allowed_domains": ["a.com"], "blocked_domains": ["b.com"]}
+    result = _normalize_websearch_args("WebSearch", ws_args)
+    assert result["allowed_domains"] == ["a.com"]
+    assert "blocked_domains" not in result
+
+    # Test _normalize_websearch_args - only blocked_domains if allowed is empty
+    ws_args = {"query": "test", "allowed_domains": [], "blocked_domains": ["b.com"]}
+    result = _normalize_websearch_args("WebSearch", ws_args)
+    assert "allowed_domains" not in result
+    assert result["blocked_domains"] == ["b.com"]
+
+    # Test _normalize_websearch_args - whitespace/invalid entries filtered
+    ws_args = {"query": "test", "allowed_domains": ["  ", "valid.com", ""], "blocked_domains": []}
+    result = _normalize_websearch_args("WebSearch", ws_args)
+    assert result["allowed_domains"] == ["valid.com"]
+    assert "blocked_domains" not in result
+
+    print("✓ websearch_args_normalization passed")
+
+
+def test_websearch_tool_call_normalized_in_response():
+    """Test that WebSearch tool calls are normalized when converting OpenAI response to Anthropic."""
+    openrouter_response = {
+        "id": "chatcmpl-websearch",
+        "object": "chat.completion",
+        "created": 1234567890,
+        "model": "anthropic/claude-sonnet",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Searching...",
+                    "tool_calls": [
+                        {
+                            "id": "toolu_ws_1",
+                            "type": "function",
+                            "function": {
+                                "name": "WebSearch",
+                                "arguments": '{"query": "test", "allowed_domains": [], "blocked_domains": []}',
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+
+    result = openai_response_to_anthropic_message(openrouter_response, "anthropic/claude-sonnet")
+
+    # Find the tool_use block
+    tool_use_block = next((b for b in result["content"] if b.get("type") == "tool_use"), None)
+    assert tool_use_block is not None
+    assert tool_use_block["name"] == "WebSearch"
+
+    # Verify empty domain arrays were removed
+    assert "allowed_domains" not in tool_use_block["input"]
+    assert "blocked_domains" not in tool_use_block["input"]
+    assert tool_use_block["input"]["query"] == "test"
+
+    print("✓ websearch_tool_call_normalized_in_response passed")
+
+
+def test_reasoning_details_reinjected_at_message_level():
+    """Test that reasoning_details is re-injected at assistant message level for Gemini 3."""
+    # First, cache reasoning_details for a tool call ID (simulating response from OpenRouter)
+    tool_call_id = "toolu_gemini_test_rd"
+    test_reasoning_details = [
+        {"type": "reasoning.text", "text": "Let me think...", "id": "rd-1"},
+        {"type": "reasoning.encrypted", "data": "abc123", "id": "rd-2"},
+    ]
+    gemini_tool_meta_put(tool_call_id, {"reasoning_details": test_reasoning_details})
+
+    # Now simulate Anthropic messages with tool_use that we need to convert back to OpenAI
+    anthropic_messages = [
+        {"role": "user", "content": "Search for something"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "I'll search for that."},
+                {
+                    "type": "tool_use",
+                    "id": tool_call_id,
+                    "name": "WebSearch",
+                    "input": {"query": "test"},
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": "Search results here",
+                }
+            ],
+        },
+    ]
+
+    # Convert to OpenAI format
+    openai_messages = anthropic_messages_to_openai_messages(anthropic_messages)
+
+    # Find the assistant message with tool_calls
+    assistant_msg = next((m for m in openai_messages if m.get("tool_calls")), None)
+    assert assistant_msg is not None
+
+    # Verify reasoning_details is present at message level
+    assert "reasoning_details" in assistant_msg, "reasoning_details should be re-injected at message level"
+    assert assistant_msg["reasoning_details"] == test_reasoning_details
+
+    # Verify thought_signature is also present in tool_calls
+    tc = assistant_msg["tool_calls"][0]
+    assert tc.get("thought_signature") is not None, "thought_signature should be present"
+
+    print("✓ reasoning_details_reinjected_at_message_level passed")
+
+
 async def test_reasoning_filtering_sse_replayer():
     """Test that SSE replayer drops reasoning/thinking blocks."""
     # Create a message with reasoning blocks
@@ -338,10 +606,16 @@ def run_all_tests():
     try:
         test_anthropic_to_openai_conversion()
         test_kimi_tool_call_normalization()
+        test_normalize_tool_id_for_anthropic()
+        test_openai_response_tool_id_normalization()
         test_cache_control_injection()
         test_message_simplification()
         test_integration_all_transformations()
         test_reasoning_filtering_non_streaming()
+        test_gemini_reasoning_details_preserved_in_cache_before_stripping()
+        test_websearch_args_normalization()
+        test_websearch_tool_call_normalized_in_response()
+        test_reasoning_details_reinjected_at_message_level()
         asyncio.run(test_reasoning_filtering_sse_replayer())
         print("\n✅ All tests passed!")
     except AssertionError as e:
